@@ -1,0 +1,577 @@
+From 660ecfa111ab42771ed82d797f3d1cc442a561cd Mon Sep 17 00:00:00 2001
+From: NiklasHeckmann <niklas.heckmann@gmail.com>
+Date: Sat, 17 Oct 2026 17:32:47 +0200
+Subject: [PATCH] Experiment: negotiated-congestion history cost
+ (PathFinder-style) and min_trace_width_um
+
+The congestion history is off by default; on the DAC2020 and KiCad demo boards it gave no
+measurable gain. Kept for reference.
+---
+ docs/settings.md                              |   6 +
+ .../autoroute/maze/AutorouteControl.java      |  28 ++++
+ .../autoroute/maze/CongestionHistory.java     | 144 ++++++++++++++++++
+ .../autoroute/maze/MazeRipupResolver.java     |   1 +
+ .../autoroute/maze/MazeSearchEngine.java      |  23 ++-
+ .../pipeline/AutorouteConnectionRouter.java   |   2 +
+ .../pipeline/AutoroutePassRunner.java         |   5 +
+ .../autoroute/pipeline/BatchAutorouter.java   |  42 +++++
+ .../freerouting/board/model/items/Pin.java    |   2 +
+ .../freerouting/settings/RouterSettings.java  |  25 +++
+ .../settings/RoutingCostSettings.java         |  15 ++
+ .../autoroute/maze/CongestionHistoryTest.java |  64 ++++++++
+ 12 files changed, 349 insertions(+), 8 deletions(-)
+ create mode 100644 src/main/java/app/freerouting/autoroute/maze/CongestionHistory.java
+ create mode 100644 src/test/java/app/freerouting/autoroute/maze/CongestionHistoryTest.java
+
+diff --git a/docs/settings.md b/docs/settings.md
+index 9552f24..0796060 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -153,6 +153,12 @@ The primary way to configure Freerouting is through a JSON settings file. This f
+ - **`plane_nets`**: Explicit array of net names to treat as power-plane nets, enabling plane-routing mode and discounted plane via costs for these nets.
+ - **`plane_as_obstacle`**: Boolean controlling whether conduction areas (copper pours) act as obstacles blocking foreign traces from passing through. Default is `false` (foreign traces may route through fills).
+ - **`start_ripup_costs`**: Cost factor for ripping up existing traces.
++- **`scoring.congestion_history_weight`**: Weight of the negotiated-congestion history cost
++  (PathFinder-style). The router remembers, per layer and board region, where earlier passes
++  ripped up items or failed to route. Crossing such a region, or ripping up an item inside it,
++  costs `1 + weight * contention` times more, so nets with a cheap detour leave contested
++  regions to the nets that need them. `0` (the default) disables it. CLI flag:
++  `--router.scoring.congestion_history_weight=1.0`.
+ - **`automatic_neckdown`**: Enables or disables automatic neckdown of traces.
+ - **`layers`**: An array of layer-specific settings (transient, typically set via CLI or loaded from board files). Each element contains:
+     - **`routable`**: Boolean indicating if the layer is active/routable by the autorouter.
+diff --git a/src/main/java/app/freerouting/autoroute/maze/AutorouteControl.java b/src/main/java/app/freerouting/autoroute/maze/AutorouteControl.java
+index 5bfc21d..2a693af 100644
+--- a/src/main/java/app/freerouting/autoroute/maze/AutorouteControl.java
++++ b/src/main/java/app/freerouting/autoroute/maze/AutorouteControl.java
+@@ -5,6 +5,7 @@ import app.freerouting.board.model.items.Item;
+ import app.freerouting.board.model.items.Pin;
+ import app.freerouting.core.library.Padstack;
+ import app.freerouting.geometry.planar.ConvexShape;
++import app.freerouting.geometry.planar.FloatPoint;
+ import app.freerouting.geometry.planar.Point;
+ import app.freerouting.logger.FRLogger;
+ import app.freerouting.rules.Net;
+@@ -60,6 +61,33 @@ public class AutorouteControl {
+   public int ripupCosts;
+   public int ripupPassNo;
+ 
++  /** Contention recorded by earlier passes, or null when the history cost is disabled. */
++  public CongestionHistory congestionHistory;
++
++  /** Weight of the history cost; the cost factor in a cell is 1 + weight * contention. */
++  public double congestionHistoryWeight;
++
++  /** Whether the history also scales trace costs in free space, not only rip-up costs. */
++  public boolean congestionHistoryOnTraceCosts = true;
++
++  /** Returns the history cost factor (at least 1) for routing through the point on the layer. */
++  double congestionFactorAt(FloatPoint point, int layer) {
++    if (congestionHistory == null
++        || congestionHistoryWeight <= 0.0
++        || !congestionHistoryOnTraceCosts) {
++      return 1.0;
++    }
++    return 1.0 + congestionHistoryWeight * congestionHistory.contentionAt(point, layer);
++  }
++
++  /** Returns the history cost factor (at least 1) for ripping up the item. */
++  double congestionFactorOf(Item item) {
++    if (congestionHistory == null || congestionHistoryWeight <= 0.0) {
++      return 1.0;
++    }
++    return 1.0 + congestionHistoryWeight * congestionHistory.contentionOf(item);
++  }
++
+   /** If true, the autoroute algorithm completes after the first drill. */
+   public boolean isFanout;
+ 
+diff --git a/src/main/java/app/freerouting/autoroute/maze/CongestionHistory.java b/src/main/java/app/freerouting/autoroute/maze/CongestionHistory.java
+new file mode 100644
+index 0000000..565adb1
+--- /dev/null
++++ b/src/main/java/app/freerouting/autoroute/maze/CongestionHistory.java
+@@ -0,0 +1,144 @@
++package app.freerouting.autoroute.maze;
++
++import app.freerouting.board.model.items.Item;
++import app.freerouting.geometry.planar.FloatPoint;
++import app.freerouting.geometry.planar.IntBox;
++
++/**
++ * Per-layer grid that remembers where connections fought over routing space during earlier
++ * rip-up-and-reroute passes (the "history cost" of the PathFinder negotiated-congestion algorithm).
++ *
++ * <p>Every time an item is ripped up, or a connection fails to route, the cells it covers gain
++ * contention. The maze search then scales the trace cost inside those cells and the rip-up cost of
++ * obstacles lying in them, so nets with a cheap detour move out of contested regions over the
++ * passes and leave them to the nets that have no alternative. The global, pass-number based rip-up
++ * escalation stays unchanged; this only adds a spatial component on top of it.
++ *
++ * <p>The history is updated sequentially by the single-threaded pass loop, so routing stays
++ * deterministic. Costs are only ever increased, which keeps the A* destination estimate a lower
++ * bound.
++ */
++public final class CongestionHistory {
++
++  /** Number of cells along the longer board side. */
++  static final int CELLS_ON_LONG_SIDE = 64;
++
++  /** Upper bound of the contention value used in cost calculations. */
++  static final double MAX_EFFECTIVE_CONTENTION = 16.0;
++
++  /** Items covering more cells than this record their contention only at their centre. */
++  private static final int MAX_CELLS_PER_RECORD = 9;
++
++  private final int minX;
++  private final int minY;
++  private final double cellSize;
++  private final int columns;
++  private final int rows;
++  private final int layerCount;
++  private final float[] contention;
++
++  private CongestionHistory(IntBox area, int layerCount) {
++    this.minX = area.ll.x;
++    this.minY = area.ll.y;
++    int width = Math.max(1, area.ur.x - area.ll.x);
++    int height = Math.max(1, area.ur.y - area.ll.y);
++    this.cellSize = Math.max(1.0, (double) Math.max(width, height) / CELLS_ON_LONG_SIDE);
++    this.columns = Math.max(1, (int) Math.ceil(width / cellSize));
++    this.rows = Math.max(1, (int) Math.ceil(height / cellSize));
++    this.layerCount = Math.max(1, layerCount);
++    this.contention = new float[this.columns * this.rows * this.layerCount];
++  }
++
++  /** Creates an empty history for the board area, or null if the area is empty. */
++  public static CongestionHistory create(IntBox boardArea, int layerCount) {
++    if (boardArea == null || boardArea.isEmpty() || layerCount <= 0) {
++      return null;
++    }
++    return new CongestionHistory(boardArea, layerCount);
++  }
++
++  /** Records one unit of contention for the region and layers occupied by the item. */
++  public void recordItem(Item item) {
++    if (item == null) {
++      return;
++    }
++    IntBox box = item.boundingBox();
++    if (box == null || box.isEmpty()) {
++      return;
++    }
++    recordBox(box, item.firstLayer(), item.lastLayer());
++  }
++
++  /** Records one unit of contention for the box on the layers firstLayer to lastLayer. */
++  public void recordBox(IntBox box, int firstLayer, int lastLayer) {
++    int fromLayer = Math.max(0, firstLayer);
++    int toLayer = Math.min(layerCount - 1, lastLayer);
++    if (fromLayer > toLayer) {
++      return;
++    }
++    int col0 = column(box.ll.x);
++    int col1 = column(box.ur.x);
++    int row0 = row(box.ll.y);
++    int row1 = row(box.ur.y);
++    if ((col1 - col0 + 1) * (row1 - row0 + 1) > MAX_CELLS_PER_RECORD) {
++      col0 = col1 = column((box.ll.x + (double) box.ur.x) / 2);
++      row0 = row1 = row((box.ll.y + (double) box.ur.y) / 2);
++    }
++    for (int layer = fromLayer; layer <= toLayer; layer++) {
++      for (int r = row0; r <= row1; r++) {
++        for (int c = col0; c <= col1; c++) {
++          contention[index(c, r, layer)] += 1.0f;
++        }
++      }
++    }
++  }
++
++  /** Returns the contention at the point on the layer, capped at MAX_EFFECTIVE_CONTENTION. */
++  public double contentionAt(FloatPoint point, int layer) {
++    if (layer < 0 || layer >= layerCount) {
++      return 0.0;
++    }
++    return Math.min(
++        contention[index(column(point.x), row(point.y), layer)], MAX_EFFECTIVE_CONTENTION);
++  }
++
++  /** Returns the highest contention of the item's region, capped at MAX_EFFECTIVE_CONTENTION. */
++  public double contentionOf(Item item) {
++    IntBox box = item.boundingBox();
++    if (box == null || box.isEmpty()) {
++      return 0.0;
++    }
++    FloatPoint centre =
++        new FloatPoint((box.ll.x + (double) box.ur.x) / 2, (box.ll.y + (double) box.ur.y) / 2);
++    double result = 0.0;
++    int fromLayer = Math.max(0, item.firstLayer());
++    int toLayer = Math.min(layerCount - 1, item.lastLayer());
++    for (int layer = fromLayer; layer <= toLayer; layer++) {
++      result = Math.max(result, contentionAt(centre, layer));
++    }
++    return result;
++  }
++
++  /** Returns the sum of all recorded contention; used for diagnostics and tests. */
++  public double totalContention() {
++    double sum = 0.0;
++    for (float value : contention) {
++      sum += value;
++    }
++    return sum;
++  }
++
++  private int column(double x) {
++    int c = (int) Math.floor((x - minX) / cellSize);
++    return Math.clamp(c, 0, columns - 1);
++  }
++
++  private int row(double y) {
++    int r = (int) Math.floor((y - minY) / cellSize);
++    return Math.clamp(r, 0, rows - 1);
++  }
++
++  private int index(int c, int r, int layer) {
++    return (layer * rows + r) * columns + c;
++  }
++}
+diff --git a/src/main/java/app/freerouting/autoroute/maze/MazeRipupResolver.java b/src/main/java/app/freerouting/autoroute/maze/MazeRipupResolver.java
+index c8b6176..97e2cca 100644
+--- a/src/main/java/app/freerouting/autoroute/maze/MazeRipupResolver.java
++++ b/src/main/java/app/freerouting/autoroute/maze/MazeRipupResolver.java
+@@ -163,6 +163,7 @@ final class MazeRipupResolver {
+     }
+     ripupCost /= detour;
+     ripupCost *= fanoutViaCostFactor;
++    ripupCost *= ctrl.congestionFactorOf(obstacleItem);
+     int result = Math.max((int) ripupCost, 1);
+     final int maxRipupCosts = Integer.MAX_VALUE / 100;
+     result = Math.min(result, maxRipupCosts);
+diff --git a/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java b/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java
+index eb27ef5..5cdca08 100644
+--- a/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java
++++ b/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java
+@@ -883,14 +883,21 @@ public class MazeSearchEngine {
+       }
+     }
+ 
+-    double expansionValue =
+-        fromElement.expansionValue
+-            + addCosts
+-            + bendCostPenalty
+-            + shapeEntryMiddle.weightedDistance(
+-                fromElement.shapeEntry.a.middlePoint(fromElement.shapeEntry.b),
+-                ctrl.traceCosts[layer].horizontal(),
+-                ctrl.traceCosts[layer].vertical());
++    FloatPoint fromEntryMiddle = fromElement.shapeEntry.a.middlePoint(fromElement.shapeEntry.b);
++    double traceCost =
++        shapeEntryMiddle.weightedDistance(
++            fromEntryMiddle,
++            ctrl.traceCosts[layer].horizontal(),
++            ctrl.traceCosts[layer].vertical());
++    if (ctrl.congestionHistory != null) {
++      traceCost *=
++          ctrl.congestionFactorAt(
++              new FloatPoint(
++                  (shapeEntryMiddle.x + fromEntryMiddle.x) / 2,
++                  (shapeEntryMiddle.y + fromEntryMiddle.y) / 2),
++              layer);
++    }
++    double expansionValue = fromElement.expansionValue + addCosts + bendCostPenalty + traceCost;
+     double sortingValue =
+         expansionValue + this.destinationDistance.calculate(shapeEntryMiddle, layer);
+     boolean roomRipped =
+diff --git a/src/main/java/app/freerouting/autoroute/pipeline/AutorouteConnectionRouter.java b/src/main/java/app/freerouting/autoroute/pipeline/AutorouteConnectionRouter.java
+index cd4da20..5c3afd5 100644
+--- a/src/main/java/app/freerouting/autoroute/pipeline/AutorouteConnectionRouter.java
++++ b/src/main/java/app/freerouting/autoroute/pipeline/AutorouteConnectionRouter.java
+@@ -45,6 +45,7 @@ final class AutorouteConnectionRouter {
+       autorouteControl.ripupAllowed = true;
+       autorouteControl.ripupCosts = router.getStartRipupCosts() * ripupPassNo;
+       autorouteControl.removeUnconnectedVias = router.isRemoveUnconnectedVias();
++      router.applyCongestionHistory(autorouteControl);
+ 
+       Set<Item> unconnectedSet = item.getUnconnectedSet(routeNetNo);
+       if (unconnectedSet.isEmpty()) {
+@@ -245,6 +246,7 @@ final class AutorouteConnectionRouter {
+     neckControl.ripupAllowed = true;
+     neckControl.ripupCosts = router.getStartRipupCosts() * ripupPassNo;
+     neckControl.removeUnconnectedVias = router.isRemoveUnconnectedVias();
++    router.applyCongestionHistory(neckControl);
+     for (int i = 0; i < neckControl.layerCount; i++) {
+       int compensation = neckControl.compensatedTraceHalfWidth[i] - neckControl.traceHalfWidth[i];
+       neckControl.traceHalfWidth[i] = Math.min(neckControl.traceHalfWidth[i], neckHalfWidth);
+diff --git a/src/main/java/app/freerouting/autoroute/pipeline/AutoroutePassRunner.java b/src/main/java/app/freerouting/autoroute/pipeline/AutoroutePassRunner.java
+index cf416e2..367816b 100644
+--- a/src/main/java/app/freerouting/autoroute/pipeline/AutoroutePassRunner.java
++++ b/src/main/java/app/freerouting/autoroute/pipeline/AutoroutePassRunner.java
+@@ -150,6 +150,11 @@ final class AutoroutePassRunner {
+           }
+ 
+           logRippedItems(currentItem, i, rippedItemList, rippedItemCosts);
++          router.recordCongestion(
++              currentItem,
++              rippedItemList,
++              autorouterResult.state == AutorouteAttemptState.FAILED
++                  || autorouterResult.state == AutorouteAttemptState.INSERT_ERROR);
+           if (FRLogger.isTraceEnabled()) {
+             logTraceRouteComparison(
+                 currentItem, i, autorouterResult, rippedItemList, netItemsBefore);
+diff --git a/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java b/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
+index 798388a..1747dc6 100644
+--- a/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
++++ b/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
+@@ -4,6 +4,7 @@ import app.freerouting.autoroute.AutorouteAttemptResult;
+ import app.freerouting.autoroute.AutorouteAttemptState;
+ import app.freerouting.autoroute.BoardHistory;
+ import app.freerouting.autoroute.maze.AutorouteControl;
++import app.freerouting.autoroute.maze.CongestionHistory;
+ import app.freerouting.board.facade.RoutingBoard;
+ import app.freerouting.board.model.items.ConductionArea;
+ import app.freerouting.board.model.items.Connectable;
+@@ -12,6 +13,7 @@ import app.freerouting.board.model.items.Item;
+ import app.freerouting.board.model.items.Pin;
+ import app.freerouting.board.model.items.Trace;
+ import app.freerouting.board.model.items.Via;
++import app.freerouting.board.model.structure.Unit;
+ import app.freerouting.core.RoutingJob;
+ import app.freerouting.core.StoppableThread;
+ import app.freerouting.core.scoring.BoardStatistics;
+@@ -23,6 +25,7 @@ import app.freerouting.rules.Net;
+ import app.freerouting.settings.RouterSettings;
+ import java.time.Instant;
+ import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -73,6 +76,10 @@ public final class BatchAutorouter extends NamedAlgorithm {
+   final boolean retainAutorouteDatabase;
+   final int startRipupCosts;
+   final int tracePullTightAccuracy;
++
++  /** Negotiated-congestion history kept across passes; null when the history cost is disabled. */
++  final CongestionHistory congestionHistory;
++
+   // Reusable collections to reduce memory churn (thread-safe as each thread has
+   // its own BatchAutorouter instance)
+   private final List<Item> reusableAutorouteItemList = new ArrayList<>();
+@@ -219,6 +226,19 @@ public final class BatchAutorouter extends NamedAlgorithm {
+ 
+     this.startRipupCosts = startRipupCosts;
+     this.tracePullTightAccuracy = pullTightAccuracy;
++    if (board != null && settings.getMinTraceWidthUm() > 0) {
++      int resolution = Math.max(1, board.communication.resolution);
++      int minWidth =
++          (int)
++              Math.round(
++                  Unit.scale(
++                      settings.getMinTraceWidthUm() * resolution, Unit.UM, board.communication.unit));
++      board.rules.setMinAllowedTraceHalfWidth(Math.max(1, minWidth / 2));
++    }
++    this.congestionHistory =
++        settings.getCongestionHistoryWeight() > 0.0 && board != null
++            ? CongestionHistory.create(board.getBoundingBox(), board.getLayerCount())
++            : null;
+     this.retainAutorouteDatabase = BENCHMARK_RETAIN_AUTOROUTE_DATABASE;
+     this.startNecked =
+         settings.autorouter == null
+@@ -259,6 +279,28 @@ public final class BatchAutorouter extends NamedAlgorithm {
+     return this.startRipupCosts;
+   }
+ 
++  /** Applies the congestion history and its weight to a connection's search control. */
++  void applyCongestionHistory(AutorouteControl control) {
++    if (this.congestionHistory != null) {
++      control.congestionHistory = this.congestionHistory;
++      control.congestionHistoryWeight = this.settings.getCongestionHistoryWeight();
++      control.congestionHistoryOnTraceCosts = this.settings.isCongestionHistoryOnTraceCosts();
++    }
++  }
++
++  /** Records contention for ripped items and failed connections of the last routed item. */
++  void recordCongestion(Item routedItem, Collection<Item> rippedItems, boolean failed) {
++    if (this.congestionHistory == null) {
++      return;
++    }
++    for (Item rippedItem : rippedItems) {
++      this.congestionHistory.recordItem(rippedItem);
++    }
++    if (failed) {
++      this.congestionHistory.recordItem(routedItem);
++    }
++  }
++
+   int getTracePullTightAccuracy() {
+     return this.tracePullTightAccuracy;
+   }
+diff --git a/src/main/java/app/freerouting/board/model/items/Pin.java b/src/main/java/app/freerouting/board/model/items/Pin.java
+index bced3a7..40a8f1b 100644
+--- a/src/main/java/app/freerouting/board/model/items/Pin.java
++++ b/src/main/java/app/freerouting/board/model/items/Pin.java
+@@ -584,6 +584,8 @@ public class Pin extends DrillItem implements Serializable {
+    */
+   public int getTraceNeckdownHalfwidth(int layer) {
+     double result = Math.max(0.5 * this.getMinWidth(layer) - 1, 1);
++    // Never neck below the narrowest trace the design rules allow (0: no limit).
++    result = Math.max(result, board.rules.getMinAllowedTraceHalfWidth());
+     return (int) result;
+   }
+ 
+diff --git a/src/main/java/app/freerouting/settings/RouterSettings.java b/src/main/java/app/freerouting/settings/RouterSettings.java
+index 4717482..95e360e 100644
+--- a/src/main/java/app/freerouting/settings/RouterSettings.java
++++ b/src/main/java/app/freerouting/settings/RouterSettings.java
+@@ -65,6 +65,14 @@ public class RouterSettings implements Serializable, Cloneable {
+   @SerializedName("neck_width_um")
+   public Double neckWidthUm;
+ 
++  /**
++   * Narrowest trace the design rules allow, in micrometers. Automatic neckdown at fine-pitch pins
++   * and necked retries never go below it. Board files exported by KiCad do not carry this limit
++   * (it lives in KiCad's own rules), so callers pass it explicitly. 0/absent = no limit.
++   */
++  @SerializedName("min_trace_width_um")
++  public Double minTraceWidthUm;
++
+   /**
+    * When true, a routed connection whose newly inserted traces/vias carry clearance violations is
+    * ripped up again and counted as not routed for that pass, instead of being kept with the
+@@ -630,6 +638,7 @@ public class RouterSettings implements Serializable, Cloneable {
+     result.planeNets = this.planeNets != null ? this.planeNets.clone() : null;
+     result.planeAsObstacle = this.planeAsObstacle;
+     result.neckWidthUm = this.neckWidthUm;
++    result.minTraceWidthUm = this.minTraceWidthUm;
+     result.strictDrc = this.strictDrc;
+     result.tracePullTightAccuracy = this.tracePullTightAccuracy;
+     result.viasAllowed = this.viasAllowed;
+@@ -653,6 +662,11 @@ public class RouterSettings implements Serializable, Cloneable {
+     return result;
+   }
+ 
++  /** Returns the narrowest allowed trace width in micrometers, or 0 when there is no limit. */
++  public double getMinTraceWidthUm() {
++    return minTraceWidthUm != null && minTraceWidthUm > 0 ? minTraceWidthUm : 0;
++  }
++
+   /** Returns the configured necking width in micrometres, or zero when disabled. */
+   public double getNeckWidthUm() {
+     return neckWidthUm != null && neckWidthUm > 0 ? neckWidthUm : 0;
+@@ -693,6 +707,17 @@ public class RouterSettings implements Serializable, Cloneable {
+     scoring.startRipupCosts = Math.max(value, 1);
+   }
+ 
++  /** Returns the negotiated-congestion history weight; zero disables the history. */
++  public double getCongestionHistoryWeight() {
++    Double weight = scoring != null ? scoring.congestionHistoryWeight : null;
++    return weight != null && weight > 0.0 ? weight : 0.0;
++  }
++
++  /** Returns whether the congestion history also raises trace costs in free space. */
++  public boolean isCongestionHistoryOnTraceCosts() {
++    return scoring == null || !Boolean.FALSE.equals(scoring.congestionHistoryTraceCosts);
++  }
++
+   /** Returns whether the autorouter should run. */
+   public boolean getRunRouter() {
+     Boolean enabled = autorouter().enabled;
+diff --git a/src/main/java/app/freerouting/settings/RoutingCostSettings.java b/src/main/java/app/freerouting/settings/RoutingCostSettings.java
+index 3ef246c..8175b14 100644
+--- a/src/main/java/app/freerouting/settings/RoutingCostSettings.java
++++ b/src/main/java/app/freerouting/settings/RoutingCostSettings.java
+@@ -54,6 +54,21 @@ public class RoutingCostSettings implements Serializable, Cloneable {
+   @SerializedName("default_bend_cost")
+   public Double defaultBendCost;
+ 
++  /**
++   * Weight of the negotiated-congestion history cost. Regions where earlier passes ripped up items
++   * or failed to route become more expensive to cross and to rip up, by a factor of {@code 1 +
++   * weight * contention}. Zero disables the history.
++   */
++  @SerializedName("congestion_history_weight")
++  public Double congestionHistoryWeight;
++
++  /**
++   * Whether the congestion history also raises trace costs in free space. When false, it only
++   * raises the rip-up cost of items in contested regions. Null means true.
++   */
++  @SerializedName("congestion_history_trace_costs")
++  public Boolean congestionHistoryTraceCosts;
++
+   /**
+    * Legacy board-score weights retained here for JSON and V1 compatibility. They will move to
+    * {@code RouterScoreSettings} when the V1 formula is separated from search costs.
+diff --git a/src/test/java/app/freerouting/autoroute/maze/CongestionHistoryTest.java b/src/test/java/app/freerouting/autoroute/maze/CongestionHistoryTest.java
+new file mode 100644
+index 0000000..4d22dcd
+--- /dev/null
++++ b/src/test/java/app/freerouting/autoroute/maze/CongestionHistoryTest.java
+@@ -0,0 +1,64 @@
++package app.freerouting.autoroute.maze;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++
++import app.freerouting.geometry.planar.FloatPoint;
++import app.freerouting.geometry.planar.IntBox;
++import org.junit.jupiter.api.Test;
++
++class CongestionHistoryTest {
++
++  private static final IntBox BOARD = new IntBox(0, 0, 64_000, 32_000);
++
++  @Test
++  void createReturnsNullForEmptyArea() {
++    assertNull(CongestionHistory.create(IntBox.EMPTY, 2));
++    assertNull(CongestionHistory.create(BOARD, 0));
++  }
++
++  @Test
++  void recordedContentionIsVisibleOnlyOnItsLayerAndCell() {
++    CongestionHistory history = CongestionHistory.create(BOARD, 2);
++
++    history.recordBox(new IntBox(1_100, 1_100, 1_200, 1_200), 0, 0);
++
++    assertEquals(1.0, history.contentionAt(new FloatPoint(1_150, 1_150), 0));
++    assertEquals(0.0, history.contentionAt(new FloatPoint(1_150, 1_150), 1));
++    assertEquals(0.0, history.contentionAt(new FloatPoint(30_000, 20_000), 0));
++  }
++
++  @Test
++  void contentionAccumulatesAndIsCapped() {
++    CongestionHistory history = CongestionHistory.create(BOARD, 1);
++    IntBox box = new IntBox(10, 10, 20, 20);
++
++    for (int i = 0; i < 100; i++) {
++      history.recordBox(box, 0, 0);
++    }
++
++    assertEquals(
++        CongestionHistory.MAX_EFFECTIVE_CONTENTION,
++        history.contentionAt(new FloatPoint(15, 15), 0));
++    assertEquals(100.0, history.totalContention());
++  }
++
++  @Test
++  void largeBoxesRecordOnlyTheirCentreCell() {
++    CongestionHistory history = CongestionHistory.create(BOARD, 1);
++
++    history.recordBox(BOARD, 0, 0);
++
++    assertEquals(1.0, history.totalContention());
++    assertEquals(1.0, history.contentionAt(new FloatPoint(32_000, 16_000), 0));
++  }
++
++  @Test
++  void pointsOutsideTheBoardClampToTheBorderCells() {
++    CongestionHistory history = CongestionHistory.create(BOARD, 1);
++    history.recordBox(new IntBox(0, 0, 10, 10), 0, 0);
++
++    assertEquals(1.0, history.contentionAt(new FloatPoint(-5_000, -5_000), 0));
++    assertEquals(0.0, history.contentionAt(new FloatPoint(1_000, 1_000), -1));
++  }
++}
+-- 
+2.37.0.windows.1
+

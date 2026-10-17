@@ -1,0 +1,57 @@
+# kicad-autoroute configuration. Every section is optional; the values shown are the defaults
+# unless marked "example". Paths are relative to this file.
+#
+#   kicad-autoroute this_file.toml
+#
+# For a plain run `kicad-autoroute board.kicad_pcb` uses exactly these defaults.
+
+board = "my_board.kicad_pcb"          # example; the project is only read, never written
+# name = "my_board"                   # default: board file name
+# work_dir = "autoroute-my_board"     # default: autoroute-<name> next to this file
+
+[strip]
+enabled = true          # remove existing tracks and vias before routing
+keep_locked = true      # keep locked tracks/vias (intentional hand routes)
+zones = false           # also remove copper zones (then define them under [zones])
+
+[placement]
+mode = "none"           # "none" or "compact": shrink the outline and re-place parts
+# Example for "compact" (parts tied to the case stay put, cable connectors slide along their edge):
+# shrink_mm = { left = 0, right = 4, top = 2, bottom = 2 }
+# anchor_regex = '^(H\d|J\d|SW\d|BZ\d)$'   # default: mounting holes, connectors, switches, buzzers
+# slide_regex = '^(J4|J7)$'
+# hv_nets = ["HV_OUT"]                     # extra spacing around parts on these nets
+# groups = true                            # keep functional groups (IC + its passives) together
+# spacing_mm = 0.5
+# iterations = 25000
+
+[escape]
+enabled = true          # short stub + via out of fine pads whose net class asks for wide copper
+min_class_width = 0.5   # only nets whose class width is at least this (mm)
+
+[stitch]
+enabled = "auto"        # vias from SMD pads of the plane net into its pour; auto = when the net exists
+net = "GND"
+# skip_refs = ["U4"]    # parts whose footprint already has thermal vias
+
+[zones]
+# Zones the pipeline adds itself (useful with strip.zones = true). Each: net + copper layers.
+# pre  = [{ net = "GND", layers = ["In1.Cu"] }]                  # before routing
+# post = [{ net = "GND", layers = ["F.Cu", "In2.Cu", "B.Cu"] }]  # pours added after routing
+post_as_planes = true   # tell the router about post-route pours already (faster, it stops earlier)
+
+[freerouting]
+seeds = 4               # runs with different item orders; the best one wins
+workers = 4             # runs in parallel; each JVM may use up to 2 GB
+timeout = "00:20:00"    # per run
+max_passes = 100
+stop_at_stagnation = true   # stop when passes stop improving; the finishing pass closes the rest
+min_trace_width = true      # pass the board's minimum track width to the router
+# args = ["--router.scoring.via_costs=60"]   # extra Freerouting settings
+
+[finish]
+candidates = 2          # best routed candidates that get the finishing pass
+texts_from_original = false
+
+[report]
+renders = false         # 3D renders before/after (kicad-cli, slow)

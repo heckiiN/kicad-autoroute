@@ -1,0 +1,162 @@
+From 60558daa3df666ad7e8d6db25ccb2d763c51d4bf Mon Sep 17 00:00:00 2001
+From: NiklasHeckmann <niklas.heckmann@gmail.com>
+Date: Sat, 17 Oct 2026 17:34:51 +0200
+Subject: [PATCH] Add router.min_trace_width_um: never neck traces below the
+ design-rule minimum
+
+Automatic neckdown at fine-pitch pins narrows traces to half the pin width minus one unit,
+with no lower bound. KiCad's Specctra export does not carry the board's minimum track width
+(it lives in KiCad's own rules), so necked traces regularly fail KiCad DRC.
+
+The new setting (micrometers, 0/absent = no limit) sets the board rules' minimum allowed
+trace half width, and Pin.getTraceNeckdownHalfwidth never returns less than that.
+---
+ docs/settings.md                              |  4 +++
+ .../autoroute/pipeline/BatchAutorouter.java   | 12 +++++++
+ .../freerouting/board/model/items/Pin.java    |  2 ++
+ .../freerouting/settings/RouterSettings.java  | 14 ++++++++
+ .../settings/MinTraceWidthSettingsTest.java   | 35 +++++++++++++++++++
+ 5 files changed, 67 insertions(+)
+ create mode 100644 src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java
+
+diff --git a/docs/settings.md b/docs/settings.md
+index 9552f24..e147247 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -154,6 +154,10 @@ The primary way to configure Freerouting is through a JSON settings file. This f
+ - **`plane_as_obstacle`**: Boolean controlling whether conduction areas (copper pours) act as obstacles blocking foreign traces from passing through. Default is `false` (foreign traces may route through fills).
+ - **`start_ripup_costs`**: Cost factor for ripping up existing traces.
+ - **`automatic_neckdown`**: Enables or disables automatic neckdown of traces.
++- **`min_trace_width_um`**: Narrowest trace width the design rules allow, in micrometers. Automatic
++  neckdown at fine-pitch pins never goes below it. Specctra DSN files exported by KiCad do not
++  carry this limit, so pass it explicitly, e.g. `--router.min_trace_width_um=150`. `0` or absent
++  means no limit.
+ - **`layers`**: An array of layer-specific settings (transient, typically set via CLI or loaded from board files). Each element contains:
+     - **`routable`**: Boolean indicating if the layer is active/routable by the autorouter.
+     - **`preferred_direction_horizontal`**: Boolean indicating if the preferred direction on this layer is horizontal.
+diff --git a/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java b/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
+index 798388a..17643d6 100644
+--- a/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
++++ b/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
+@@ -12,6 +12,7 @@ import app.freerouting.board.model.items.Item;
+ import app.freerouting.board.model.items.Pin;
+ import app.freerouting.board.model.items.Trace;
+ import app.freerouting.board.model.items.Via;
++import app.freerouting.board.model.structure.Unit;
+ import app.freerouting.core.RoutingJob;
+ import app.freerouting.core.StoppableThread;
+ import app.freerouting.core.scoring.BoardStatistics;
+@@ -219,6 +220,17 @@ public final class BatchAutorouter extends NamedAlgorithm {
+ 
+     this.startRipupCosts = startRipupCosts;
+     this.tracePullTightAccuracy = pullTightAccuracy;
++    if (board != null && settings.getMinTraceWidthUm() > 0) {
++      int resolution = Math.max(1, board.communication.resolution);
++      int minWidth =
++          (int)
++              Math.round(
++                  Unit.scale(
++                      settings.getMinTraceWidthUm() * resolution,
++                      Unit.UM,
++                      board.communication.unit));
++      board.rules.setMinAllowedTraceHalfWidth(Math.max(1, minWidth / 2));
++    }
+     this.retainAutorouteDatabase = BENCHMARK_RETAIN_AUTOROUTE_DATABASE;
+     this.startNecked =
+         settings.autorouter == null
+diff --git a/src/main/java/app/freerouting/board/model/items/Pin.java b/src/main/java/app/freerouting/board/model/items/Pin.java
+index bced3a7..40a8f1b 100644
+--- a/src/main/java/app/freerouting/board/model/items/Pin.java
++++ b/src/main/java/app/freerouting/board/model/items/Pin.java
+@@ -584,6 +584,8 @@ public class Pin extends DrillItem implements Serializable {
+    */
+   public int getTraceNeckdownHalfwidth(int layer) {
+     double result = Math.max(0.5 * this.getMinWidth(layer) - 1, 1);
++    // Never neck below the narrowest trace the design rules allow (0: no limit).
++    result = Math.max(result, board.rules.getMinAllowedTraceHalfWidth());
+     return (int) result;
+   }
+ 
+diff --git a/src/main/java/app/freerouting/settings/RouterSettings.java b/src/main/java/app/freerouting/settings/RouterSettings.java
+index 4717482..2361cee 100644
+--- a/src/main/java/app/freerouting/settings/RouterSettings.java
++++ b/src/main/java/app/freerouting/settings/RouterSettings.java
+@@ -65,6 +65,14 @@ public class RouterSettings implements Serializable, Cloneable {
+   @SerializedName("neck_width_um")
+   public Double neckWidthUm;
+ 
++  /**
++   * Narrowest trace the design rules allow, in micrometers. Automatic neckdown at fine-pitch pins
++   * and necked retries never go below it. Board files exported by KiCad do not carry this limit (it
++   * lives in KiCad's own rules), so callers pass it explicitly. 0/absent = no limit.
++   */
++  @SerializedName("min_trace_width_um")
++  public Double minTraceWidthUm;
++
+   /**
+    * When true, a routed connection whose newly inserted traces/vias carry clearance violations is
+    * ripped up again and counted as not routed for that pass, instead of being kept with the
+@@ -630,6 +638,7 @@ public class RouterSettings implements Serializable, Cloneable {
+     result.planeNets = this.planeNets != null ? this.planeNets.clone() : null;
+     result.planeAsObstacle = this.planeAsObstacle;
+     result.neckWidthUm = this.neckWidthUm;
++    result.minTraceWidthUm = this.minTraceWidthUm;
+     result.strictDrc = this.strictDrc;
+     result.tracePullTightAccuracy = this.tracePullTightAccuracy;
+     result.viasAllowed = this.viasAllowed;
+@@ -653,6 +662,11 @@ public class RouterSettings implements Serializable, Cloneable {
+     return result;
+   }
+ 
++  /** Returns the narrowest allowed trace width in micrometers, or 0 when there is no limit. */
++  public double getMinTraceWidthUm() {
++    return minTraceWidthUm != null && minTraceWidthUm > 0 ? minTraceWidthUm : 0;
++  }
++
+   /** Returns the configured necking width in micrometres, or zero when disabled. */
+   public double getNeckWidthUm() {
+     return neckWidthUm != null && neckWidthUm > 0 ? neckWidthUm : 0;
+diff --git a/src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java b/src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java
+new file mode 100644
+index 0000000..9cd7cf4
+--- /dev/null
++++ b/src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java
+@@ -0,0 +1,35 @@
++package app.freerouting.settings;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import app.freerouting.settings.sources.CliSettings;
++import org.junit.jupiter.api.Test;
++
++/** CLI plumbing and helper semantics for the min_trace_width_um setting. */
++class MinTraceWidthSettingsTest {
++
++  @Test
++  void cliFlagReachesRouterSettings() {
++    CliSettings cli = new CliSettings(new String[] {"--router.min_trace_width_um=150"});
++    assertEquals(150.0, cli.getSettings().getMinTraceWidthUm(), 1e-9);
++  }
++
++  @Test
++  void defaultIsNoLimit() {
++    assertEquals(0.0, new RouterSettings().getMinTraceWidthUm(), 1e-9);
++  }
++
++  @Test
++  void negativeMeansNoLimit() {
++    RouterSettings settings = new RouterSettings();
++    settings.minTraceWidthUm = -5.0;
++    assertEquals(0.0, settings.getMinTraceWidthUm(), 1e-9);
++  }
++
++  @Test
++  void cloneCarriesTheField() {
++    RouterSettings settings = new RouterSettings();
++    settings.minTraceWidthUm = 200.0;
++    assertEquals(200.0, settings.clone().getMinTraceWidthUm(), 1e-9);
++  }
++}
+-- 
+2.37.0.windows.1
+

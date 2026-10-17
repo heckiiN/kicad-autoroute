@@ -1,0 +1,316 @@
+"""Autorouting pipeline for KiCad boards: rule-driven preparation, Freerouting on several seeds,
+KiCad-DRC scoring and a finishing pass. Normally started through the CLI (`kicad-autoroute`).
+
+Steps, each optional through the config (see configs/example.toml):
+  1. copy     board + project + rules into <work>/board (the source project is only read)
+  2. strip    remove existing tracks/vias (keep locked ones if strip.keep_locked)
+  3. place    optional placement change: "compact" shrinks the outline and re-places parts
+              (anchored parts follow their edge, functional groups move as rigid blocks)
+  4. escape   short narrow stubs + vias for wide-net pads that are narrower than the net class
+  5. stitch   stitching vias from SMD pads of the plane net (e.g. GND) into the plane
+  6. zones    pre-route zones (e.g. GND plane on an inner layer)
+  7. route    Freerouting on N item-order seeds in parallel
+  8. score    import each result into KiCad, add post-route zones, fill, DRC: rank by
+              unconnected, DRC errors, vias, length
+  9. finish   best candidates: replace necked tracks, last-mile router for what is still open, drop
+              dangling leftovers and too-close vias, silkscreen clean-up, DRC
+ 10. report   best finished board, report.json, 3D renders before/after
+Results: <work>/result/<name>.kicad_pcb (+ .kicad_pro/.kicad_dru), report.json, renders.
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from . import render_board, router, tools
+
+HERE = Path(__file__).resolve().parent
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def kpy(script: Path, *args: str, timeout: int = 3600, fatal: bool = True) -> str:
+    try:
+        res = subprocess.run([str(tools.kicad_python()), str(script), *map(str, args)], capture_output=True, text=True,
+                             timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if fatal:
+            raise SystemExit(f"{script.name} {' '.join(map(str, args))} timed out after {timeout} s")
+        return f"{script.name}: timed out after {timeout} s, skipped"
+    out = "\n".join(l for l in (res.stdout + res.stderr).splitlines()
+                    if "image handler" not in l and "memory leak" not in l)
+    if res.returncode != 0:
+        raise SystemExit(f"{script.name} {' '.join(map(str, args))} failed:\n{out[-2000:]}")
+    return out.strip()
+
+
+def steps(*args: str) -> str:
+    return kpy(HERE / "kicad_steps.py", *args)
+
+
+def copy_project(src: Path, dst_dir: Path, name: str) -> Path:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for ext in (".kicad_pcb", ".kicad_pro", ".kicad_dru"):
+        f = src.with_suffix(ext)
+        if f.exists():
+            shutil.copyfile(f, dst_dir / f"{name}{ext}")
+    for extra in ("fp-lib-table", "sym-lib-table"):
+        if (src.parent / extra).exists():
+            shutil.copyfile(src.parent / extra, dst_dir / extra)
+    # project-local footprint/3D libraries (${KIPRJMOD}/lib), needed for complete 3D renders
+    lib = src.parent / "lib"
+    if lib.is_dir() and not (dst_dir / "lib").exists():
+        size = sum(f.stat().st_size for f in lib.rglob("*") if f.is_file())
+        if size < 200 * 1024 * 1024:
+            shutil.copytree(lib, dst_dir / "lib")
+    return dst_dir / f"{name}.kicad_pcb"
+
+
+def edge_clearance_um(pro: Path) -> int | None:
+    try:
+        rules = json.load(open(pro, encoding="utf-8"))["board"]["design_settings"]["rules"]
+        v = rules.get("min_copper_edge_clearance")
+        return int(round(v * 1000)) if v else None
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def min_track_width(pro: Path, dru: Path) -> float:
+    widths = []
+    try:
+        rules = json.load(open(pro, encoding="utf-8"))["board"]["design_settings"]["rules"]
+        if rules.get("min_track_width"):
+            widths.append(rules["min_track_width"])
+    except (OSError, KeyError, ValueError):
+        pass
+    if dru.exists():
+        import re
+        for m in re.finditer(r"constraint\s+track_width\s+\(min\s+([\d.]+)\s*mm\)", dru.read_text(encoding="utf-8")):
+            widths.append(float(m.group(1)))
+    return min(widths) if widths else 0.15
+
+
+def drc(pcb: Path) -> dict:
+    report = pcb.with_name(pcb.stem + "_drc.json")
+    subprocess.run([str(tools.kicad_cli()), "pcb", "drc", "--refill-zones", "--format", "json", "--severity-error",
+                    "-o", str(report), str(pcb)], capture_output=True, text=True, timeout=3600)
+    data = json.loads(report.read_text(encoding="utf-8"))
+    errors: dict[str, int] = {}
+    for v in data.get("violations", []):
+        errors[v.get("type", "?")] = errors.get(v.get("type", "?"), 0) + 1
+    return {"unconnected": len(data.get("unconnected_items", [])), "errors": errors,
+            "error_count": sum(errors.values())}
+
+
+def drc_all(pcb: Path) -> Path:
+    report = pcb.with_name(pcb.stem + "_drc_all.json")
+    subprocess.run([str(tools.kicad_cli()), "pcb", "drc", "--refill-zones", "--format", "json", "-o", str(report), str(pcb)],
+                   capture_output=True, text=True, timeout=3600)
+    return report
+
+
+def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, rounds: int = 4) -> list[str]:
+    """Close what the router left: replace necked tracks, last-mile route open connections, drop
+    dangling leftovers and too-close vias, repeat; then clean up the silkscreen."""
+    notes = []
+    if min_w:
+        notes.append(steps("drop_narrow", pcb, min_w))
+    for _ in range(rounds):
+        report = pcb.with_name(pcb.stem + "_drc_err.json")
+        subprocess.run([str(tools.kicad_cli()), "pcb", "drc", "--refill-zones", "--format", "json", "--severity-error",
+                        "-o", str(report), str(pcb)], capture_output=True, text=True, timeout=3600)
+        if json.loads(report.read_text(encoding="utf-8")).get("unconnected_items"):
+            notes.append(kpy(HERE / "lastmile.py", pcb, report, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+        full = drc_all(pcb)
+        data = json.loads(full.read_text(encoding="utf-8"))
+        kinds = {v.get("type") for v in data.get("violations", [])}
+        errors = {v.get("type") for v in data.get("violations", []) if v.get("severity") == "error"}
+        if not kinds & {"track_dangling", "via_dangling", "hole_to_hole"} and not errors                 and not data.get("unconnected_items"):
+            break
+        notes.append(steps("drop_dangling", pcb, full))
+        notes.append(steps("drop_close_vias", pcb, full))
+        notes.append(steps("drop_offenders", pcb, full))
+        notes.append(kpy(HERE / "zone_stitch.py", pcb, timeout=1500, fatal=False))
+        islands = pcb.with_name(pcb.stem + "_islands.json")
+        if islands.exists() and json.loads(islands.read_text(encoding="utf-8")).get("unconnected_items"):
+            notes.append(kpy(HERE / "lastmile.py", pcb, islands, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+    silk_args = [pcb, "--original", original] + (["--texts-from-original"] if texts_from_original else [])
+    notes.append(kpy(HERE / "silk_fix.py", *silk_args))
+    return notes
+
+
+def score_session(pre: Path, ses: Path, out_dir: Path, post_zones: list, min_w: float) -> dict:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pcb = copy_project(pre, out_dir, ses.stem)
+    steps("import", pcb, ses.resolve(), pcb)
+    if post_zones:
+        steps("zones", pcb, json.dumps(post_zones))
+    result = drc(pcb)
+    result.update(json.loads(steps("stats", pcb).splitlines()[-1]))
+    result["ses"] = str(ses)
+    result["board"] = str(pcb)
+    return result
+
+
+def rank_key(r: dict):
+    return (r["unconnected"], r["error_count"], r["vias"], r["track_mm"])
+
+
+MARKER = ".kicad-autoroute"
+
+
+def prepare_work_dir(work: Path) -> None:
+    """Start from an empty work directory. Only a directory this tool created earlier (it holds the
+    marker file) is cleared; anything else that is not empty is left alone."""
+    if work.exists() and any(work.iterdir()):
+        if not (work / MARKER).exists():
+            raise SystemExit(f"{work} exists and was not created by kicad-autoroute; choose another output directory")
+        shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / MARKER).write_text("work directory of kicad-autoroute; safe to delete\n", encoding="utf-8")
+
+
+def run(cfg: dict, base: Path, label: str = "") -> dict:
+    """Run the pipeline for one board. Paths in cfg are relative to base. Returns the report."""
+    t0 = time.time()
+    src = (base / cfg["board"]).resolve()
+    name = cfg.get("name", src.stem)
+    work = (base / cfg.get("work_dir", f"autoroute-{name}")).resolve()
+    prepare_work_dir(work)
+    log(f"board {src} -> {work}")
+
+    # 1-2: copy and strip
+    pre = copy_project(src, work / "board", name)
+    pro, dru = pre.with_suffix(".kicad_pro"), pre.with_suffix(".kicad_dru")
+    reference = drc(copy_project(src, work / "reference", name))
+    reference.update(json.loads(steps("stats", work / "reference" / f"{name}.kicad_pcb").splitlines()[-1]))
+    log(f"reference: {reference}")
+    strip_cfg = cfg.get("strip", {})
+    if strip_cfg.get("enabled", True):
+        log(steps("strip", pre, *(["--keep-locked"] if strip_cfg.get("keep_locked") else []),
+                  *(["--zones"] if strip_cfg.get("zones") else [])))
+
+    # 3: placement
+    place = cfg.get("placement", {})
+    if place.get("mode", "none") == "compact":
+        dsn = work / "place" / f"{name}_bare.dsn"
+        dsn.parent.mkdir(parents=True, exist_ok=True)
+        steps("export", pre, dsn)
+        plan = work / "place" / "placement.json"
+        shrink = place.get("shrink_mm", {})
+        cmd = [sys.executable, str(HERE / "compact.py"), str(dsn), "-o", str(plan),
+               "--spacing", str(place.get("spacing_mm", 0.5)), "--iterations", str(place.get("iterations", 25000))]
+        for edge in ("left", "right", "top", "bottom"):
+            cmd += [f"--{edge}", str(shrink.get(edge, 0))]
+        if place.get("anchor_regex"):
+            cmd += ["--anchor-re", place["anchor_regex"]]
+        if place.get("slide_regex"):
+            cmd += ["--slide-re", place["slide_regex"]]
+        if place.get("hv_nets"):
+            cmd += ["--hv-nets", ",".join(place["hv_nets"])]
+        if place.get("groups", True):
+            cmd += ["--groups"]
+        if edge_clearance_um(pro):
+            cmd += ["--edge-clearance", str(edge_clearance_um(pro) / 1000)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise SystemExit(res.stderr[-2000:])
+        log("placement: " + " | ".join(l for l in res.stdout.splitlines() if l.startswith(("outline", "wrote"))))
+        log(steps("apply", pre, plan))
+
+    # 4-6: rule-driven pre-routing
+    esc = cfg.get("escape", {})
+    if esc.get("enabled", True):
+        log(kpy(HERE / "escape.py", pre, "--min-class-width", esc.get("min_class_width", 0.5)))
+    st = cfg.get("stitch", {})
+    if st.get("enabled", False):
+        args = [pre, "--net", st.get("net", "GND")]
+        if st.get("skip_refs"):
+            args += ["--skip-refs", ",".join(st["skip_refs"])]
+        log(kpy(HERE / "stitch.py", *args))
+    zones = cfg.get("zones", {})
+    pre_zones = list(zones.get("pre", []))
+    # Post-route pours go in before routing too: the DSN then carries them as planes, so the router
+    # knows those pads are connected and stops instead of retrying them until the time limit.
+    if zones.get("post_as_planes", True):
+        pre_zones += zones.get("post", [])
+    if pre_zones:
+        log(steps("zones", pre, json.dumps(pre_zones)))
+    dsn = work / "route" / f"{name}.dsn"
+    dsn.parent.mkdir(parents=True, exist_ok=True)
+    log(steps("export", pre, dsn))
+
+    # 7: route
+    fr = cfg.get("freerouting", {})
+    extra = list(fr.get("args", []))
+    edge_um = edge_clearance_um(pro)
+    if edge_um and not any("copper_to_edge" in a for a in extra):
+        extra.append(f"--router.copper_to_edge_clearance_um={edge_um}")
+    if fr.get("stop_at_stagnation", True):
+        # the last-mile router closes the few connections a stagnating run leaves; Freerouting's own
+        # fallback strategies would otherwise repeat attempts until the time limit
+        for flag in ("--router.autorouter.fallback_strategies=none", "--router.autorouter.residual_repair_max_open=0"):
+            if not any(flag.split("=")[0] in a for a in extra):
+                extra.append(flag)
+    min_w_um = int(round(min_track_width(pro, dru) * 1000))
+    if fr.get("min_trace_width", True) and not any("min_trace_width" in a for a in extra):
+        extra.append(f"--router.min_trace_width_um={min_w_um}")
+    seeds = fr.get("seeds", 4)
+    jobs = [(dsn, f"s{s}", extra + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"]))
+            for s in range(seeds)]
+    log(f"routing {seeds} seeds, {fr.get('workers', 4)} in parallel, timeout {fr.get('timeout', '00:15:00')}")
+    router.run_matrix(jobs, fr.get("workers", 4), work / "route", fr.get("timeout", "00:15:00"),
+                     fr.get("max_passes", 100), "route")
+
+    # 8: score in KiCad
+    min_w = min_track_width(pro, dru)
+    post = zones.get("post", [])
+    scored = []
+    for ses in sorted((work / "route").glob("*.ses")):
+        r = score_session(pre, ses, work / "score" / ses.stem, post, min_w)
+        log(f"{ses.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} "
+            f"track_mm={r['track_mm']}")
+        scored.append(r)
+    if not scored:
+        raise SystemExit("no routing result")
+    best = min(scored, key=rank_key)
+
+    # 9: finish the best candidates (last mile, clean-up, silkscreen), keep the best finished board
+    finish_cfg = cfg.get("finish", {})
+    finished = []
+    for cand in sorted(scored, key=rank_key)[: finish_cfg.get("candidates", 2)]:
+        pcb = Path(cand["board"])
+        notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False))
+        r = drc(pcb)
+        r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
+        r.update({"ses": cand["ses"], "board": str(pcb), "notes": notes, "raw": {k: cand[k] for k in ("unconnected", "errors", "vias", "track_mm")}})
+        log(f"finished {pcb.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} track_mm={r['track_mm']}")
+        finished.append(r)
+    best = min(finished, key=rank_key)
+
+    # 10: result + report
+    result_dir = work / "result"
+    final = copy_project(Path(best["board"]), result_dir, name)
+    renders = {}
+    if cfg.get("report", {}).get("renders", False):
+        for tag, board in (("before", work / "reference" / f"{name}.kicad_pcb"), ("after", final)):
+            try:
+                renders[tag] = [str(p) for p in render_board.render_views(board, result_dir / "img", tag)]
+            except RuntimeError as exc:
+                log(f"render {tag} failed: {exc}")
+    report = {"config": label, "reference": reference, "best": best, "finished": finished, "all": scored,
+              "renders": renders, "timing_s": round(time.time() - t0)}
+    (result_dir / "report.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+    log(f"best: {Path(best['ses']).stem} unconnected={best['unconnected']} errors={best['errors']} "
+        f"vias={best['vias']} track_mm={best['track_mm']} board_mm={best['board_mm']}")
+    log(f"reference: unconnected={reference['unconnected']} errors={reference['errors']} "
+        f"vias={reference['vias']} track_mm={reference['track_mm']} board_mm={reference['board_mm']}")
+    log(f"result: {final}")
+    report["result"] = str(final)
+    return report

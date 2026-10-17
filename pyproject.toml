@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kicad-autoroute"
+version = "0.1.0"
+description = "Autorouting pipeline for KiCad boards: rule-aware preparation, Freerouting on several seeds, KiCad-DRC scoring and a finishing pass"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+kicad-autoroute = "kicad_autoroute.cli:main"
+
+[tool.setuptools]
+packages = ["kicad_autoroute"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
