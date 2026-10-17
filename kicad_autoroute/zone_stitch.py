@@ -139,7 +139,7 @@ anchors += [(TO(p.GetPosition().x), TO(p.GetPosition().y)) for f in b.GetFootpri
 
 # the inner layer that carries a pour of the net: islands that have no room for a via of their own are
 # tied to it by the last-mile router (pad -> short trace -> via -> plane)
-plane_layer = None
+plane_layer, plane_zone = None, None
 best_area = 0
 for z in b.Zones():
     if z.GetNetname() == ns.net and not z.GetIsRuleArea():
@@ -147,7 +147,7 @@ for z in b.Zones():
             if layer not in (pcbnew.F_Cu, pcbnew.B_Cu):
                 area = z.GetFilledPolysList(layer).Area()
                 if area > best_area:
-                    plane_layer, best_area = layer, area
+                    plane_layer, plane_zone, best_area = layer, z, area
 # filled copper of the net per layer: an island via only helps where it lands in the net's fill on
 # another layer (a 2-layer board with a single GND pour has nothing to tie an island to)
 fills = {}
@@ -250,9 +250,9 @@ for z in b.Zones():
                                 px, py = TO(p.GetPosition().x), TO(p.GetPosition().y)
                                 requests.append({"items": [
                                     {"description": f"Pad {p.GetNumber()} [{ns.net}] von {f.GetReference()} auf {b.GetLayerName(layer)}",
-                                     "pos": {"x": px, "y": py}},
+                                     "pos": {"x": px, "y": py}, "uuid": p.m_Uuid.AsString()},
                                     {"description": f"Zone [{ns.net}] auf {b.GetLayerName(plane_layer)}",
-                                     "pos": {"x": px, "y": py}}]})
+                                     "pos": {"x": px, "y": py}, "uuid": plane_zone.m_Uuid.AsString()}]})
                                 break
                         else:
                             continue

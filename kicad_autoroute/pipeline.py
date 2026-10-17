@@ -46,6 +46,9 @@ def kpy(script: Path, *args: str, timeout: int = 3600, fatal: bool = True) -> st
     out = "\n".join(l for l in (res.stdout + res.stderr).splitlines()
                     if "image handler" not in l and "memory leak" not in l)
     if res.returncode != 0:
+        if not fatal:
+            last = out.strip().splitlines()[-1] if out.strip() else "no output"
+            return f"{script.name}: failed, skipped ({last})"
         raise SystemExit(f"{script.name} {' '.join(map(str, args))} failed:\n{out[-2000:]}")
     return out.strip()
 
