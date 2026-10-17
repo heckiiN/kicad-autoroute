@@ -67,7 +67,7 @@ Needs:
 - **git** and **Python 3.11+**
 
 ```bash
-git clone https://github.com/<you>/kicad-autoroute
+git clone https://github.com/heckiiN/kicad-autoroute
 cd kicad-autoroute
 python -m venv .venv && .venv/bin/pip install -e .        # Windows: .venv\Scripts\pip install -e .
 JAVA_HOME=/path/to/jdk-25 python freerouting-patches/build_freerouting.py
