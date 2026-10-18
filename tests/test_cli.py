@@ -50,3 +50,19 @@ def test_work_dir_is_only_cleared_when_ours(tmp_path):
     (ours / "old.txt").write_text("x", encoding="utf-8")
     pipeline.prepare_work_dir(ours)
     assert not (ours / "old.txt").exists() and (ours / pipeline.MARKER).exists()
+
+
+def test_candidates_cover_every_variant_within_reach():
+    def r(stem, unconnected, vias=0):
+        return {"ses": f"{stem}.ses", "unconnected": unconnected, "error_count": 0, "vias": vias, "track_mm": 1.0}
+    scored = [r("b__s0", 1, 10), r("b__s3", 2, 5), r("b_main__s1_main", 3), r("b_1L__s2_1L", 9)]
+    picked = [c["ses"] for c in pipeline.pick_candidates(scored, 2)]
+    assert picked == ["b__s0.ses", "b_main__s1_main.ses"]   # single-layer leaves too much open
+
+
+def test_off_share_ranks_main_layer_boards_first():
+    clean = {"unconnected": 0, "error_count": 0, "vias": 0, "track_mm": 200, "layer_mm": {"B.Cu": 200}}
+    mixed = {"unconnected": 0, "error_count": 0, "vias": 0, "track_mm": 160, "layer_mm": {"B.Cu": 100, "F.Cu": 60}}
+    for x in (clean, mixed):
+        x["off_share"] = pipeline.off_share(x, "B.Cu")
+    assert min([mixed, clean], key=pipeline.rank_key) is clean

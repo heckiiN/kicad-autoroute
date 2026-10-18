@@ -144,6 +144,40 @@ def fix_clearances(tree, board: str) -> list[str]:
     return notes
 
 
+def single_layer(src: str, dst: str, layer: str) -> int:
+    """Copy of a DSN in which every net class may only use one layer (single-sided routing, the way a
+    simple through-hole board is laid out by hand). Returns the number of classes restricted."""
+    tree = dsn.read(src)
+    n = 0
+    for cls in dsn.children(dsn.child(tree, "network"), "class"):
+        circuit = dsn.child(cls, "circuit")
+        if circuit is None:
+            circuit = [Atom("circuit")]
+            cls.append(circuit)
+        circuit[:] = [c for c in circuit if dsn.head(c) != "use_layer"]
+        circuit.append([Atom("use_layer"), Atom(layer, True)])
+        n += 1
+    Path(dst).write_text(dsn.dumps(tree) + "\n", encoding="latin-1")
+    return n
+
+
+def layer_costs(path: str, main: str, factor: float) -> None:
+    """Make traces on every layer but `main` cost `factor` times more, so the router keeps most
+    copper on one side and uses the other for crossings, as people lay out 2-layer boards."""
+    tree = dsn.read(path)
+    structure = dsn.child(tree, "structure")
+    structure[:] = [c for c in structure if dsn.head(c) != "autoroute_settings"]
+    settings = [Atom("autoroute_settings"), [Atom("autoroute"), Atom("on")], [Atom("postroute"), Atom("off")]]
+    for layer in dsn.children(structure, "layer"):
+        name = dsn.atoms(layer)[1]
+        cost = 1.0 if name == main else factor
+        settings.append([Atom("layer_rule"), Atom(name, True),
+                         [Atom("preferred_direction_trace_costs"), Atom(f"{cost:.1f}")],
+                         [Atom("against_preferred_direction_trace_costs"), Atom(f"{cost * 1.2:.1f}")]])
+    structure.append(settings)
+    Path(path).write_text(dsn.dumps(tree) + "\n", encoding="latin-1")
+
+
 def fix(dsn_path: str, board: str) -> list[str]:
     tree = dsn.read(dsn_path)
     notes = fix_vias(tree, ViaRules.for_board(board)) + fix_minimums(tree, board) + fix_clearances(tree, board)

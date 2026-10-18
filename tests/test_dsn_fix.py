@@ -87,3 +87,22 @@ def test_custom_rules_become_classes(project, tmp_path):
     assert pairs[("IsoDRU2000G", "kicad_default")] == 2000
     assert pairs[("IsoDRU2000G", "kicaddefaultDRU2500")] == 2500     # the stricter side wins
     assert any("Iso" in n for n in notes)
+
+
+def test_single_layer_variant(tmp_path):
+    src, dst = tmp_path / "a.dsn", tmp_path / "b.dsn"
+    src.write_text(DSN, encoding="latin-1")
+    assert dsn_fix.single_layer(str(src), str(dst), "B.Cu") == 2
+    for cls in classes(dsn.read(dst)).values():
+        assert [dsn.atoms(u) for u in dsn.children(dsn.child(cls, "circuit"), "use_layer")] == [["use_layer", "B.Cu"]]
+
+
+def test_layer_costs(tmp_path):
+    path = tmp_path / "a.dsn"
+    path.write_text(DSN, encoding="latin-1")
+    dsn_fix.layer_costs(str(path), "B.Cu", 2.0)
+    settings = dsn.child(dsn.child(dsn.read(path), "structure"), "autoroute_settings")
+    costs = {dsn.atoms(r)[1]: float(dsn.atoms(dsn.child(r, "preferred_direction_trace_costs"))[1])
+             for r in dsn.children(settings, "layer_rule")}
+    assert costs == {"F.Cu": 2.0, "B.Cu": 1.0}
+    assert dsn.atoms(dsn.child(settings, "postroute")) == ["postroute", "off"]

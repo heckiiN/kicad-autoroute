@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import render_board, router, tools
+from . import dsn_fix, render_board, router, tools
 
 HERE = Path(__file__).resolve().parent
 
@@ -161,8 +161,44 @@ def score_session(pre: Path, ses: Path, out_dir: Path, post_zones: list, min_w: 
     return result
 
 
+def off_share(r: dict, main_layer: str | None) -> float:
+    """Share of the track length off the main layer (2-layer boards), in steps of 10 %."""
+    lengths = r.get("layer_mm") or {}
+    total = sum(lengths.values())
+    if not main_layer or not total:
+        return 0.0
+    return round(1 - lengths.get(main_layer, 0.0) / total, 1)
+
+
 def rank_key(r: dict):
-    return (r["unconnected"], r["error_count"], r["vias"], r["track_mm"])
+    """Fewest open connections, then DRC errors, vias, copper off the main layer (people keep 2-layer
+    boards mostly on one side), length."""
+    return (r["unconnected"], r["error_count"], r["vias"], r.get("off_share", 0.0), r["track_mm"])
+
+
+def pick_candidates(scored: list[dict], n: int) -> list[dict]:
+    """The best routed result of every routing variant (both layers, single layer), then the next best
+    overall up to n: a single-layer result usually leaves more open before finishing but often ends
+    up cleaner after it."""
+    ranked = sorted(scored, key=rank_key)
+    picked, variants = [], set()
+    # a variant that leaves many more connections open is not worth finishing: the last-mile router
+    # would spend its whole budget on it
+    reach = ranked[0]["unconnected"] + 3 if ranked else 0
+    for r in ranked:
+        if r["unconnected"] > reach:
+            continue
+        stem = Path(r["ses"]).stem
+        variant = "_1L" if stem.endswith("_1L") else "_main" if stem.endswith("_main") else ""
+        if variant not in variants:
+            variants.add(variant)
+            picked.append(r)
+    for r in ranked:
+        if len(picked) >= max(n, len(variants)):
+            break
+        if r not in picked:
+            picked.append(r)
+    return picked
 
 
 MARKER = ".kicad-autoroute"
@@ -265,8 +301,28 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     if fr.get("min_trace_width", True) and not any("min_trace_width" in a for a in extra):
         extra.append(f"--router.min_trace_width_um={min_w_um}")
     seeds = fr.get("seeds", 4)
-    jobs = [(dsn, f"s{s}", extra + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"]))
-            for s in range(seeds)]
+    # 2-layer boards get routing variants next to the plain one: the main side preferred (most copper
+    # on one side, the other for crossings) and single-sided (the finishing pass adds jumpers). Every
+    # variant gets seeds; ranking keeps completeness first, so a style never costs connections.
+    dsns = [(dsn, "")]
+    pref = json.loads(steps("layer_pref", pre, cfg.get("stitch", {}).get("net", "GND")).splitlines()[-1])
+    main_layer = pref["layer"] if pref["copper_layers"] == 2 else None
+    if main_layer and seeds >= 3:
+        cost = fr.get("other_layer_cost", 2.0)
+        if cost > 1.0:
+            weighted = dsn.with_name(dsn.stem + "_main.dsn")
+            shutil.copyfile(dsn, weighted)
+            dsn_fix.layer_costs(str(weighted), main_layer, cost)
+            dsns.append((weighted, "_main"))
+        if fr.get("single_layer", True):
+            single = dsn.with_name(dsn.stem + "_1L.dsn")
+            dsn_fix.single_layer(str(dsn), str(single), main_layer)
+            dsns.append((single, "_1L"))
+        log(f"2-layer variants: {', '.join(t or 'plain' for _p, t in dsns)} (main layer {main_layer}, {pref['side']})")
+    jobs = []
+    for s in range(seeds):
+        path, tag = dsns[s % len(dsns)]
+        jobs.append((path, f"s{s}{tag}", extra + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"])))
     log(f"routing {seeds} seeds, {fr.get('workers', 4)} in parallel, timeout {fr.get('timeout', '00:15:00')}")
     router.run_matrix(jobs, fr.get("workers", 4), work / "route", fr.get("timeout", "00:15:00"),
                      fr.get("max_passes", 100), "route")
@@ -277,6 +333,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     scored = []
     for ses in sorted((work / "route").glob("*.ses")):
         r = score_session(pre, ses, work / "score" / ses.stem, post, min_w)
+        r["off_share"] = off_share(r, main_layer)
         log(f"{ses.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} "
             f"track_mm={r['track_mm']}")
         scored.append(r)
@@ -287,11 +344,12 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     # 9: finish the best candidates (last mile, clean-up, silkscreen), keep the best finished board
     finish_cfg = cfg.get("finish", {})
     finished = []
-    for cand in sorted(scored, key=rank_key)[: finish_cfg.get("candidates", 2)]:
+    for cand in pick_candidates(scored, finish_cfg.get("candidates", 2)):
         pcb = Path(cand["board"])
         notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False))
         r = drc(pcb)
         r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
+        r["off_share"] = off_share(r, main_layer)
         r.update({"ses": cand["ses"], "board": str(pcb), "notes": notes, "raw": {k: cand[k] for k in ("unconnected", "errors", "vias", "track_mm")}})
         log(f"finished {pcb.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} track_mm={r['track_mm']}")
         finished.append(r)

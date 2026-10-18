@@ -10,6 +10,7 @@
   <kicad-python> kicad_steps.py drop_dangling board.kicad_pcb drc_all.json
   <kicad-python> kicad_steps.py drop_close_vias board.kicad_pcb drc_all.json
   <kicad-python> kicad_steps.py stats  board.kicad_pcb
+  <kicad-python> kicad_steps.py layer_pref board.kicad_pcb GND
 
 strip   removes tracks and vias (optionally keeps locked ones, i.e. intentional hand routes)
 apply   moves footprints to the KiCad-frame positions of a placement JSON and, when the JSON has an
@@ -229,10 +230,41 @@ def stats(path):
     tracks = [t for t in b.GetTracks() if t.GetClass() == "PCB_TRACK"]
     vias = [t for t in b.GetTracks() if t.GetClass() == "PCB_VIA"]
     box = b.GetBoardEdgesBoundingBox()
-    print(json.dumps({"tracks": len(tracks), "vias": len(vias),
+    layer_mm = {}
+    for t in tracks:
+        name = b.GetLayerName(t.GetLayer())
+        layer_mm[name] = round(layer_mm.get(name, 0.0) + t.GetLength() / 1e6, 1)
+    print(json.dumps({"tracks": len(tracks), "vias": len(vias), "layer_mm": layer_mm,
                       "track_mm": round(sum(t.GetLength() for t in tracks) / 1e6, 1),
                       "board_mm": [round(TO(box.GetWidth()), 2), round(TO(box.GetHeight()), 2)],
                       "footprints": len(b.GetFootprints())}))
+
+
+def layer_pref(path, plane_net):
+    """Layer for single-layer routing of a 2-layer board, as a human would pick it: the side with
+    most SMD pads; on an all through-hole board the side carrying the plane net's pour (else bottom)."""
+    b = pcbnew.LoadBoard(path)
+    smd = {pcbnew.F_Cu: 0, pcbnew.B_Cu: 0}
+    for f in b.GetFootprints():
+        for p in f.Pads():
+            if p.GetAttribute() == pcbnew.PAD_ATTRIB_SMD:
+                for l in smd:
+                    if p.IsOnLayer(l):
+                        smd[l] += 1
+    pour = {l: 0.0 for l in smd}
+    for z in b.Zones():
+        if z.GetNetname() == plane_net and not z.GetIsRuleArea():
+            for l in pour:
+                if z.GetLayerSet().Contains(l):
+                    pour[l] += 1
+    if any(smd.values()):
+        layer = max(smd, key=smd.get)
+    elif pour[pcbnew.F_Cu] and not pour[pcbnew.B_Cu]:
+        layer = pcbnew.F_Cu
+    else:
+        layer = pcbnew.B_Cu
+    print(json.dumps({"copper_layers": b.GetCopperLayerCount(), "layer": b.GetLayerName(layer),
+                      "side": "top" if layer == pcbnew.F_Cu else "bottom", "smd_pads": list(smd.values())}))
 
 
 if __name__ == "__main__":
@@ -260,5 +292,7 @@ if __name__ == "__main__":
         drop_offenders(args[0], args[1])
     elif cmd == "stats":
         stats(args[0])
+    elif cmd == "layer_pref":
+        layer_pref(args[0], args[1] if len(args) > 1 else "GND")
     else:
         raise SystemExit(__doc__)
