@@ -319,13 +319,29 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
             dsn_fix.single_layer(str(dsn), str(single), main_layer)
             dsns.append((single, "_1L"))
         log(f"2-layer variants: {', '.join(t or 'plain' for _p, t in dsns)} (main layer {main_layer}, {pref['side']})")
-    jobs = []
-    for s in range(seeds):
-        path, tag = dsns[s % len(dsns)]
-        jobs.append((path, f"s{s}{tag}", extra + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"])))
-    log(f"routing {seeds} seeds, {fr.get('workers', 4)} in parallel, timeout {fr.get('timeout', '00:15:00')}")
-    router.run_matrix(jobs, fr.get("workers", 4), work / "route", fr.get("timeout", "00:15:00"),
-                     fr.get("max_passes", 100), "route")
+    # half of all runs use the plain variant (it gets furthest on hard boards), the rest alternate
+    # between the styles
+    pattern = [0, 1, 0, 2] if len(dsns) == 3 else [0, 1] if len(dsns) == 2 else [0]
+
+    def make_jobs(first, last):
+        out = []
+        for s in range(first, last):
+            path, tag = dsns[pattern[s % len(pattern)]]
+            out.append((path, f"s{s}{tag}", extra + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"])))
+        return out
+    workers, timeout = fr.get("workers", 4), fr.get("timeout", "00:15:00")
+    log(f"routing {seeds} seeds, {workers} in parallel, timeout {timeout}")
+    results = router.run_matrix(make_jobs(0, seeds), workers, work / "route", timeout, fr.get("max_passes", 100), "route")
+    # small boards route in seconds: more seeds then cost little and smooth out Freerouting's run-to-run
+    # spread, so add waves while a wave stays quick
+    quick = fr.get("quick_wave_s", 120)
+    total = fr.get("max_seeds", 12)
+    while seeds < total and results and max(r.wall_s for r in results) < quick:
+        more = min(total, seeds + max(workers, 4))
+        log(f"first runs took under {quick} s: adding seeds {seeds}..{more - 1}")
+        results = router.run_matrix(make_jobs(seeds, more), workers, work / "route", timeout,
+                                    fr.get("max_passes", 100), "route")
+        seeds = more
 
     # 8: score in KiCad
     min_w = min_track_width(pro, dru)

@@ -11,6 +11,7 @@ width is tried first, then the minimum width. Found paths are inserted as tracks
 The caller re-runs DRC and keeps the result only if it got better.
 """
 import argparse
+import functools
 import heapq
 import json
 import math
@@ -59,6 +60,7 @@ EDGE = (TO(ebb.GetLeft()), TO(ebb.GetTop()), TO(ebb.GetRight()), TO(ebb.GetBotto
 report = json.load(open(ns.drc, encoding="utf-8"))
 
 
+@functools.lru_cache(maxsize=None)
 def need(a, c):
     return max(classes.clearance(a), classes.clearance(c), extra.get(a, 0.0), extra.get(c, 0.0))
 
@@ -120,27 +122,33 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all"):
         m = need(net, inet) + half_w + 0.75 * g
         if kind == "box":
             bx0, by0, bx1, by1 = geo
-            if bx1 + m < xs[0] or bx0 - m > xs[-1] or by1 + m < ys[0] or by0 - m > ys[-1]:
-                continue
-            d = np.hypot(np.maximum(np.maximum(bx0 - X, 0), X - bx1), np.maximum(np.maximum(by0 - Y, 0), Y - by1))
-            hit = d < m
+            lo_x, lo_y, hi_x, hi_y = bx0 - m, by0 - m, bx1 + m, by1 + m
         elif kind == "disc":
             cx, cy, r = geo
-            if cx + r + m < xs[0] or cx - r - m > xs[-1] or cy + r + m < ys[0] or cy - r - m > ys[-1]:
-                continue
-            hit = np.hypot(X - cx, Y - cy) < r + m
+            lo_x, lo_y, hi_x, hi_y = cx - r - m, cy - r - m, cx + r + m, cy + r + m
         else:
             sx, sy, ex, ey, hw = geo
-            if max(sx, ex) + hw + m < xs[0] or min(sx, ex) - hw - m > xs[-1] or \
-               max(sy, ey) + hw + m < ys[0] or min(sy, ey) - hw - m > ys[-1]:
-                continue
+            lo_x, lo_y = min(sx, ex) - hw - m, min(sy, ey) - hw - m
+            hi_x, hi_y = max(sx, ex) + hw + m, max(sy, ey) + hw + m
+        # only the cells around the item: its bounding box plus the margin, clipped to the window
+        i0, i1 = max(0, int((lo_x - x0) / g)), min(nx, int((hi_x - x0) / g) + 2)
+        j0, j1 = max(0, int((lo_y - y0) / g)), min(ny, int((hi_y - y0) / g) + 2)
+        if i0 >= i1 or j0 >= j1:
+            continue
+        Xs, Ys = X[j0:j1, i0:i1], Y[j0:j1, i0:i1]
+        if kind == "box":
+            d = np.hypot(np.maximum(np.maximum(bx0 - Xs, 0), Xs - bx1), np.maximum(np.maximum(by0 - Ys, 0), Ys - by1))
+            hit = d < m
+        elif kind == "disc":
+            hit = np.hypot(Xs - cx, Ys - cy) < r + m
+        else:
             dx, dy = ex - sx, ey - sy
             L = dx * dx + dy * dy
-            t = np.clip(((X - sx) * dx + (Y - sy) * dy) / L, 0, 1) if L > 0 else 0
-            hit = np.hypot(X - (sx + t * dx), Y - (sy + t * dy)) < hw + m
+            t = np.clip(((Xs - sx) * dx + (Ys - sy) * dy) / L, 0, 1) if L > 0 else 0
+            hit = np.hypot(Xs - (sx + t * dx), Ys - (sy + t * dy)) < hw + m
         for l in ilayers:
             if l in maps:
-                maps[l] |= hit
+                maps[l][j0:j1, i0:i1] |= hit
     if which != "soft":
         edge_m = ns.edge + half_w
         out = (X < EDGE[0] + edge_m) | (X > EDGE[2] - edge_m) | (Y < EDGE[1] + edge_m) | (Y > EDGE[3] - edge_m)
@@ -238,7 +246,11 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
     ys = y0 + np.arange(ny) * g
     X, Y = np.meshgrid(xs, ys)
     for hx, hy, hr in holes:
-        via_ok &= np.hypot(X - hx, Y - hy) >= hr + ns.via[1] / 2 + ns.hole_clearance
+        reach = hr + ns.via[1] / 2 + ns.hole_clearance
+        i0, i1 = max(0, int((hx - reach - x0) / g)), min(nx, int((hx + reach - x0) / g) + 2)
+        j0, j1 = max(0, int((hy - reach - y0) / g)), min(ny, int((hy + reach - y0) / g) + 2)
+        if i0 < i1 and j0 < j1:
+            via_ok[j0:j1, i0:i1] &= np.hypot(X[j0:j1, i0:i1] - hx, Y[j0:j1, i0:i1] - hy) >= reach
     li = {l: i for i, l in enumerate(layers)}
 
     def cell(p):
@@ -267,46 +279,72 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
         dx, dy = abs(x - gc[0]), abs(y - gc[1])
         return max(dx, dy) + 0.414 * min(dx, dy)
 
-    start = [(sc[0], sc[1], li[l], NONE) for l in la]
-    dist = {s: 0.0 for s in start}
-    prev = {}
-    heap = [(h(sc[0], sc[1]), 0.0, s) for s in start]
-    heapq.heapify(heap)
-    found = None
-    expanded = 0
-    while heap:
-        expanded += 1
-        if expanded > ns.max_expansions or (expanded % 5000 == 0 and time.time() > deadline):
-            break
-        f, d, node = heapq.heappop(heap)
-        x, y, k, last = node
-        if (x, y, k) in goal:
-            found = node
-            break
-        if d > dist.get(node, 1e18):
-            continue
-        nbrs = []
-        for i, (dx, dy, c) in enumerate(dirs):
-            if last != NONE:
-                turn = min((i - last) % 8, (last - i) % 8)
-                if turn > 2:
-                    continue        # no acute or reversing corners
-                c += turn * turn_cost
-            nx_, ny_ = x + dx, y + dy
-            if 0 <= nx_ < nx and 0 <= ny_ < ny and not tmaps[layers[k]][ny_, nx_]:
-                if smaps is not None and smaps[layers[k]][ny_, nx_]:
+    # flat byte maps: much faster to index in the inner loop than numpy arrays
+    L = len(layers)
+    hard = [tmaps[layers[k]].tobytes() for k in range(L)]
+    soft = [smaps[layers[k]].tobytes() for k in range(L)] if smaps is not None else None
+    vias = via_ok.tobytes()
+
+    def search(directional, weight, limit):
+        """A* over (x, y, layer, last direction). Without directions it is a quick feasibility test:
+        a ninth of the states, so a connection that cannot be made fails fast."""
+        start = [(sc[0], sc[1], li[l], NONE) for l in la]
+        dist = {s_: 0.0 for s_ in start}
+        prev = {}
+        heap = [(weight * h(sc[0], sc[1]), 0.0, s_) for s_ in start]
+        heapq.heapify(heap)
+        expanded = 0
+        while heap:
+            expanded += 1
+            if expanded > limit or (expanded % 5000 == 0 and time.time() > deadline):
+                return None, prev
+            f, d, node = heapq.heappop(heap)
+            x, y, k, last = node
+            if (x, y, k) in goal:
+                return node, prev
+            if d > dist.get(node, 1e18):
+                continue
+            hk = hard[k]
+            sk = soft[k] if soft is not None else None
+            for i, (dx, dy, c) in enumerate(dirs):
+                if directional and last != NONE:
+                    turn = min((i - last) % 8, (last - i) % 8)
+                    if turn > 2:
+                        continue        # no acute or reversing corners
+                    c += turn * turn_cost
+                nx_, ny_ = x + dx, y + dy
+                if not (0 <= nx_ < nx and 0 <= ny_ < ny):
+                    continue
+                cell_ = ny_ * nx + nx_
+                if hk[cell_]:
+                    continue
+                if sk is not None and sk[cell_]:
                     c += rip_cell
-                nbrs.append(((nx_, ny_, k, i), c))
-        if via_ok[y, x]:
-            for k2 in range(len(layers)):
-                if k2 != k and not tmaps[layers[k2]][y, x] and not (smaps is not None and smaps[layers[k2]][y, x]):
-                    nbrs.append(((x, y, k2, NONE), via_cost))
-        for nb, c in nbrs:
-            nd = d + c
-            if nd < dist.get(nb, 1e18):
-                dist[nb] = nd
-                prev[nb] = node
-                heapq.heappush(heap, (nd + h(nb[0], nb[1]), nd, nb))
+                nb = (nx_, ny_, k, i if directional else NONE)
+                nd = d + c
+                if nd < dist.get(nb, 1e18):
+                    dist[nb] = nd
+                    prev[nb] = node
+                    heapq.heappush(heap, (nd + weight * h(nx_, ny_), nd, nb))
+            here = y * nx + x
+            if vias[here]:
+                for k2 in range(L):
+                    if k2 != k and not hard[k2][here] and not (soft is not None and soft[k2][here]):
+                        nb = (x, y, k2, NONE)
+                        nd = d + via_cost
+                        if nd < dist.get(nb, 1e18):
+                            dist[nb] = nd
+                            prev[nb] = node
+                            heapq.heappush(heap, (nd + weight * h(x, y), nd, nb))
+        return None, prev
+
+    found, prev = search(False, 1.0, ns.max_expansions)
+    if found is not None:
+        # a path exists: search again with corner costs, aimed a little harder at the goal; keep the
+        # plain path if that search runs out of budget
+        found2, prev2 = search(True, 1.2, ns.max_expansions)
+        if found2 is not None:
+            found, prev = found2, prev2
     if not found:
         return None
     path = [found]
