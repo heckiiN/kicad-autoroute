@@ -38,6 +38,10 @@ ap.add_argument("--bend-cost", type=float, default=0.5, help="cost of each 45 de
 ap.add_argument("--hole-clearance", type=float, default=0.25, help="min gap between drill holes")
 ap.add_argument("--max-span", type=float, default=0.0, help="skip connections longer than this (mm), 0 = no limit")
 ap.add_argument("--max-expansions", type=int, default=400000, help="search nodes per connection before giving up")
+ap.add_argument("-v", "--verbose", action="store_true", help="explain failed connections")
+ap.add_argument("--max-rip", type=int, default=6, help="tracks a blocked connection may rip up (0: no rip-up)")
+ap.add_argument("--max-rip-nets", type=int, default=2, help="nets whose tracks a rip-up may move")
+ap.add_argument("--rip-cost", type=float, default=1.0, help="cost of crossing a rippable track, mm of trace per grid cell")
 ap.add_argument("--max-cells", type=float, default=600000, help="grid cells per layer before the grid gets coarser")
 ap.add_argument("--time-budget", type=float, default=900.0,
                 help="seconds for all connections together; short connections go first")
@@ -69,13 +73,14 @@ for t in b.GetTracks():
     if t.GetClass() == "PCB_VIA":
         holes.append((TO(t.GetPosition().x), TO(t.GetPosition().y), TO(t.GetDrillValue()) / 2))
 
-# copper shapes as (net, layers, kind, geometry) in mm
+# copper shapes as (net, layers, kind, geometry, ref) in mm; ref is the board track for unlocked
+# tracks (these may be ripped up and re-routed), None for everything that stays
 items = []
 for f in b.GetFootprints():
     for p in f.Pads():
         bb = p.GetBoundingBox()
         pl = [l for l in layers if p.IsOnLayer(l)]
-        items.append((p.GetNetname(), pl, "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom()))))
+        items.append((p.GetNetname(), pl, "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
 # copper text and graphics (board level and inside footprints) are fixed copper without a net
 copper_art = list(b.GetDrawings())
 for f in b.GetFootprints():
@@ -86,27 +91,33 @@ for d in copper_art:
     if pcbnew.IsCopperLayer(d.GetLayer()) and d.GetLayer() in layers:
         bb = d.GetBoundingBox()
         net = d.GetNetname() if hasattr(d, "GetNetname") else ""
-        items.append((net, [d.GetLayer()], "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom()))))
+        items.append((net, [d.GetLayer()], "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
 for t in b.GetTracks():
     if t.GetClass() == "PCB_VIA":
         r = TO(t.GetWidth(pcbnew.F_Cu)) / 2
-        items.append((t.GetNetname(), layers, "disc", (TO(t.GetPosition().x), TO(t.GetPosition().y), r)))
+        items.append((t.GetNetname(), layers, "disc", (TO(t.GetPosition().x), TO(t.GetPosition().y), r), None))
     else:
         items.append((t.GetNetname(), [t.GetLayer()], "seg",
-                      (TO(t.GetStart().x), TO(t.GetStart().y), TO(t.GetEnd().x), TO(t.GetEnd().y), TO(t.GetWidth()) / 2)))
+                      (TO(t.GetStart().x), TO(t.GetStart().y), TO(t.GetEnd().x), TO(t.GetEnd().y), TO(t.GetWidth()) / 2),
+                      t if t.GetClass() == "PCB_TRACK" and not t.IsLocked() else None))
 
 
-def blocked_map(net, x0, y0, nx, ny, g, half_w):
-    """Per layer boolean grid: True where a trace centre of half width half_w would violate clearance."""
+def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all"):
+    """Per layer boolean grid: True where a trace centre of half width half_w would violate clearance.
+    which: "all" items, only "hard" ones (fixed copper) or only "soft" ones (rippable tracks)."""
     xs = x0 + np.arange(nx) * g
     ys = y0 + np.arange(ny) * g
     X, Y = np.meshgrid(xs, ys)  # [ny, nx]
     maps = {l: np.zeros((ny, nx), bool) for l in layers}
-    for inet, ilayers, kind, geo in items:
-        if inet == net:
+    for it in items:
+        if it is None:
             continue
-        # one grid step of margin: paths run between cell centres and diagonals cut corners
-        m = need(net, inet) + half_w + g
+        inet, ilayers, kind, geo, ref = it
+        if inet == net or (which == "hard" and ref is not None) or (which == "soft" and ref is None):
+            continue
+        # paths run straight between free cell centres; such a segment comes at most half a diagonal
+        # step (0.71 g) closer to an obstacle than its end points
+        m = need(net, inet) + half_w + 0.75 * g
         if kind == "box":
             bx0, by0, bx1, by1 = geo
             if bx1 + m < xs[0] or bx0 - m > xs[-1] or by1 + m < ys[0] or by0 - m > ys[-1]:
@@ -130,10 +141,11 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w):
         for l in ilayers:
             if l in maps:
                 maps[l] |= hit
-    edge_m = ns.edge + half_w
-    out = (X < EDGE[0] + edge_m) | (X > EDGE[2] - edge_m) | (Y < EDGE[1] + edge_m) | (Y > EDGE[3] - edge_m)
-    for l in layers:
-        maps[l] |= out
+    if which != "soft":
+        edge_m = ns.edge + half_w
+        out = (X < EDGE[0] + edge_m) | (X > EDGE[2] - edge_m) | (Y < EDGE[1] + edge_m) | (Y > EDGE[3] - edge_m)
+        for l in layers:
+            maps[l] |= out
     return maps
 
 
@@ -202,17 +214,23 @@ def zone_target(zone, start, zone_layers):
     return (best[1], best[2]) if best else (None, None)
 
 
-def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf")):
+def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), soft=False, fine=False):
+    """Grid A* from a to b_pt. With soft=True unlocked tracks of other nets are passable at a cost
+    (rip-up search); otherwise they block like everything else."""
     # long connections search on a coarser grid (at most MAX_CELLS per layer); the clearance margin
     # grows with the grid step, so a coarse path is still legal
     w_mm = abs(a[0] - b_pt[0]) + 2 * ns.window
     h_mm = abs(a[1] - b_pt[1]) + 2 * ns.window
     g = min(0.2, max(ns.grid, math.sqrt(w_mm * h_mm / MAX_CELLS)))
+    if fine:  # second try for tight passages (between IC pins): half the grid step
+        g = max(ns.grid / 2, math.sqrt(w_mm * h_mm / (4 * MAX_CELLS)))
     x0 = min(a[0], b_pt[0]) - ns.window
     y0 = min(a[1], b_pt[1]) - ns.window
     nx = int((max(a[0], b_pt[0]) + ns.window - x0) / g) + 1
     ny = int((max(a[1], b_pt[1]) + ns.window - y0) / g) + 1
-    tmaps = blocked_map(net, x0, y0, nx, ny, g, width / 2)
+    tmaps = blocked_map(net, x0, y0, nx, ny, g, width / 2, "hard" if soft else "all")
+    smaps = blocked_map(net, x0, y0, nx, ny, g, width / 2, "soft") if soft else None
+    rip_cell = ns.rip_cost / g
     vr = ns.via[0] / 2
     vmaps = blocked_map(net, x0, y0, nx, ny, g, vr)
     via_ok = ~np.any(np.stack([vmaps[l] for l in layers]), axis=0)
@@ -236,6 +254,8 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf")):
     for (cx, cy), ls in ((sc, la), (gc, lb)):
         for l in ls:
             tmaps[l][max(0, cy - 1):cy + 2, max(0, cx - 1):cx + 2] = False
+            if smaps is not None:
+                smaps[l][max(0, cy - 1):cy + 2, max(0, cx - 1):cx + 2] = False
     # 8 directions in angular order, so |i - j| (mod 8) counts 45 degree steps between them
     dirs = [(1, 0, 1.0), (1, 1, 1.414), (0, 1, 1.0), (-1, 1, 1.414), (-1, 0, 1.0), (-1, -1, 1.414),
             (0, -1, 1.0), (1, -1, 1.414)]
@@ -274,10 +294,12 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf")):
                 c += turn * turn_cost
             nx_, ny_ = x + dx, y + dy
             if 0 <= nx_ < nx and 0 <= ny_ < ny and not tmaps[layers[k]][ny_, nx_]:
+                if smaps is not None and smaps[layers[k]][ny_, nx_]:
+                    c += rip_cell
                 nbrs.append(((nx_, ny_, k, i), c))
         if via_ok[y, x]:
             for k2 in range(len(layers)):
-                if k2 != k and not tmaps[layers[k2]][y, x]:
+                if k2 != k and not tmaps[layers[k2]][y, x] and not (smaps is not None and smaps[layers[k2]][y, x]):
                     nbrs.append(((x, y, k2, NONE), via_cost))
         for nb, c in nbrs:
             nd = d + c
@@ -299,9 +321,14 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf")):
     return pts
 
 
+def _sign(v):
+    return 0 if abs(v) < 1e-6 else (1 if v > 0 else -1)
+
+
 def insert(net_name, path, width):
+    """Adds the path as tracks and vias; returns the new board items."""
     net = b.FindNet(net_name)
-    added = 0
+    added = []
     # simplify: keep points where direction or layer changes
     pts = [path[0]]
     for i in range(1, len(path) - 1):
@@ -309,8 +336,8 @@ def insert(net_name, path, width):
         if p1[2] != p0[2] or p2[2] != p1[2]:
             pts.append(p1)
             continue
-        d1 = (round((p1[0] - p0[0]) / ns.grid), round((p1[1] - p0[1]) / ns.grid))
-        d2 = (round((p2[0] - p1[0]) / ns.grid), round((p2[1] - p1[1]) / ns.grid))
+        d1 = (_sign(p1[0] - p0[0]), _sign(p1[1] - p0[1]))   # step directions, independent of the grid
+        d2 = (_sign(p2[0] - p1[0]), _sign(p2[1] - p1[1]))
         if d1[0] * d2[1] != d1[1] * d2[0] or d1[0] * d2[0] + d1[1] * d2[1] < 0:
             pts.append(p1)
     pts.append(path[-1])
@@ -321,8 +348,8 @@ def insert(net_name, path, width):
             v.SetWidth(FROM(ns.via[0])); v.SetDrill(FROM(ns.via[1])); v.SetNet(net)
             b.Add(v)
             holes.append((p[0], p[1], ns.via[1] / 2))
-            items.append((net_name, layers, "disc", (p[0], p[1], ns.via[0] / 2)))
-            added += 1
+            items.append((net_name, layers, "disc", (p[0], p[1], ns.via[0] / 2), None))
+            added.append(v)
             continue
         if (p[0], p[1]) == (q[0], q[1]):
             continue
@@ -331,9 +358,125 @@ def insert(net_name, path, width):
         t.SetEnd(pcbnew.VECTOR2I(FROM(q[0]), FROM(q[1])))
         t.SetWidth(FROM(width)); t.SetLayer(p[2]); t.SetNet(net)
         b.Add(t)
-        items.append((net_name, [p[2]], "seg", (p[0], p[1], q[0], q[1], width / 2)))
-        added += 1
+        items.append((net_name, [p[2]], "seg", (p[0], p[1], q[0], q[1], width / 2), t))
+        added.append(t)
     return added
+
+
+def say(msg):
+    if ns.verbose:
+        print(msg, flush=True)
+
+
+def _pt_seg(px, py, sx, sy, ex, ey):
+    dx, dy = ex - sx, ey - sy
+    L = dx * dx + dy * dy
+    t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / L))
+    return math.hypot(px - sx - t * dx, py - sy - t * dy)
+
+
+def _seg_seg(a, b_):
+    (ax, ay, bx, by), (cx, cy, dx, dy) = a, b_
+
+    def orient(px, py, qx, qy, rx, ry):
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px)
+    o1, o2 = orient(ax, ay, bx, by, cx, cy), orient(ax, ay, bx, by, dx, dy)
+    o3, o4 = orient(cx, cy, dx, dy, ax, ay), orient(cx, cy, dx, dy, bx, by)
+    if o1 * o2 < 0 and o3 * o4 < 0:
+        return 0.0
+    return min(_pt_seg(ax, ay, cx, cy, dx, dy), _pt_seg(bx, by, cx, cy, dx, dy),
+               _pt_seg(cx, cy, ax, ay, bx, by), _pt_seg(dx, dy, ax, ay, bx, by))
+
+
+def victims_of(new_items, net):
+    """Indices of rippable other-net tracks (in items) that the new tracks/vias violate."""
+    shapes = []
+    for o in new_items:
+        if o.GetClass() == "PCB_VIA":
+            shapes.append((None, (TO(o.GetPosition().x), TO(o.GetPosition().y)), TO(o.GetWidth(pcbnew.F_Cu)) / 2))
+        else:
+            shapes.append((o.GetLayer(), (TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y)),
+                           TO(o.GetWidth()) / 2))
+    found = []
+    for idx, it in enumerate(items):
+        if it is None:
+            continue
+        inet, ilayers, kind, geo, ref = it
+        if ref is None or inet == net or kind != "seg":
+            continue
+        clr = need(net, inet) - 1e-4
+        for layer, g_, r in shapes:
+            if layer is None:
+                d = _pt_seg(g_[0], g_[1], *geo[:4]) - r - geo[4]
+            elif layer in ilayers:
+                d = _seg_seg(g_, geo[:4]) - r - geo[4]
+            else:
+                continue
+            if d < clr:
+                found.append(idx)
+                break
+    return found
+
+
+def cut_ends(segs):
+    """Loose ends of a set of ripped track segments [(layer, x1, y1, x2, y2)]: the points where the
+    rest of the net's copper continues."""
+    count = {}
+    for layer, x1, y1, x2, y2 in segs:
+        for q in ((layer, round(x1, 4), round(y1, 4)), (layer, round(x2, 4), round(y2, 4))):
+            count[q] = count.get(q, 0) + 1
+    return [q for q, n in count.items() if n == 1]
+
+
+def ripup(net, a, c, la, lc, width, goal_radius, deadline):
+    """Route a blocked connection through unlocked tracks of other nets, rip those tracks and route
+    them again around the new one. Everything is undone unless all of it succeeds."""
+    path = route(net, a, c, la, lc, width, goal_radius, deadline, soft=True)
+    if not path:
+        say(f"rip-up {net}: no path even through rippable tracks")
+        return None
+    n_items, n_holes = len(items), len(holes)
+    created = insert(net, path, width)
+    victims = victims_of(created, net)
+    removed, rerouted = [], []
+
+    def undo():
+        for o in created + rerouted:
+            b.Delete(o)
+        for i in range(n_items, len(items)):
+            items[i] = None
+        del holes[n_holes:]
+        for idx, entry in removed:
+            b.Add(entry[4])
+            items[idx] = entry
+        return None
+
+    if not victims or len(victims) > ns.max_rip:
+        say(f"rip-up {net}: {len(victims)} tracks in the way (limit {ns.max_rip})")
+        return undo()
+    by_net = {}
+    for idx in victims:
+        entry = items[idx]
+        by_net.setdefault(entry[0], []).append((entry[4].GetLayer(),) + tuple(entry[3][:4]))
+        b.Remove(entry[4])
+        removed.append((idx, entry))
+        items[idx] = None
+    widths = {e[0]: e[3][4] * 2 for _i, e in removed}
+    if len(by_net) > ns.max_rip_nets:
+        say(f"rip-up {net}: {len(by_net)} nets in the way (limit {ns.max_rip_nets})")
+        return undo()
+    for vnet, segs in by_net.items():
+        ends = cut_ends(segs)
+        if len(ends) != 2:
+            say(f"rip-up {net}: ripped tracks of {vnet} leave {len(ends)} loose ends")
+            return undo()
+        (l1, x1, y1), (l2, x2, y2) = ends
+        p = route(vnet, (x1, y1), (x2, y2), [l1], [l2], widths[vnet], 0.0, deadline)
+        if not p:
+            say(f"rip-up {net}: {vnet} could not be routed again")
+            return undo()
+        rerouted += insert(vnet, p, widths[vnet])
+    return len(victims), sorted(by_net)
 
 
 t_start = time.time()
@@ -371,6 +514,7 @@ for u in sorted(report.get("unconnected_items", []), key=span):
                 continue
             lc = [layer]
         goal_radius = 0.3   # anywhere in the pour right there
+    say(f"{net}: {ka} {a} on {[b.GetLayerName(l) for l in la]} -> {kc} {c} on {[b.GetLayerName(l) for l in lc]}")
     if (ns.max_span and math.hypot(a[0] - c[0], a[1] - c[1]) > ns.max_span) or time.time() - t_start > ns.time_budget:
         skipped.append(net)
         continue
@@ -378,9 +522,22 @@ for u in sorted(report.get("unconnected_items", []), key=span):
     for w in sorted({classes.width(net), max(ns.min_width, 0.1)}, reverse=True):
         path = route(net, a, c, la, lc, w, goal_radius=goal_radius, deadline=t_start + ns.time_budget)
         if path:
-            n = insert(net, path, w)
+            n = len(insert(net, path, w))
             done.append(f"{net} ({w} mm, {n} items)")
             break
+    if not path:
+        w = max(ns.min_width, 0.1)
+        path = route(net, a, c, la, lc, w, goal_radius=goal_radius, deadline=t_start + ns.time_budget, fine=True)
+        if path:
+            n = len(insert(net, path, w))
+            done.append(f"{net} ({w} mm, fine grid, {n} items)")
+    if not path and ns.max_rip > 0:
+        for w in sorted({classes.width(net), max(ns.min_width, 0.1)}, reverse=True):
+            res = ripup(net, a, c, la, lc, w, goal_radius, t_start + ns.time_budget)
+            if res:
+                path = True
+                done.append(f"{net} ({w} mm, ripped and re-routed {res[0]} tracks of {', '.join(res[1])})")
+                break
     if not path:
         failed.append(net)
 b.Save(ns.board)

@@ -23,22 +23,23 @@ This is an early version (0.1). It reliably beats the plain Freerouting plugin w
 **not** finish every board: on larger boards some connections stay open and have to be routed by hand.
 
 KiCad's demo boards, default settings, no per-board tuning, run with `benchmark/run_benchmark.py`
-(full output in `docs/benchmark-2026-10-17.md`); the last row is a private board, routed in an earlier run with the same settings.
+(full output in `docs/benchmark-2026-10-18.md`, plugin-workflow numbers from `docs/benchmark-2026-10-17.md`); the last row
+is a private board, routed in an earlier version with the same settings.
 Cells: unconnected / DRC errors, counted by KiCad's DRC after refilling zones.
 
 | Board | Layers / parts | Original (hand-routed) | Freerouting plugin workflow¹ | **kicad-autoroute** | Time |
 |---|---|---|---|---|---|
 | ecc83 | 2 / 15 | 0 / 0 | 0 / 0 | **0 / 0** | 1 min |
-| sonde xilinx | 2 / 25 | 0 / 0 | 2 / 2 | **1 / 0** | 4 min |
-| pic_programmer | 2 / 63 | 0 / 0 | 2 / 2 | **0 / 0** | 3 min |
-| interf_u | 2 / 25 | 0 / 2 | 13 / 5 | **3 / 3**² | 27 min |
-| multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **1 / 0** | 3 min |
-| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **6 / 0**³ | 28 min |
+| sonde xilinx | 2 / 25 | 0 / 0 | 2 / 2 | **0 / 0** | 1 min |
+| pic_programmer | 2 / 63 | 0 / 0 | 2 / 2 | **0 / 0** | 2 min |
+| interf_u | 2 / 25 | 0 / 2 | 13 / 5 | **2 / 4**² | 11 min |
+| multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **2 / 0**³ | 8 min |
+| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **8 / 0**³ | 52 min |
 | private board (HV rules) | 4 / 491 | 0 / 0 | no result in 1 h | **83 / 2**² | 2.6 h |
 
 ¹ Tracks removed, KiCad's Specctra export, Freerouting 2.4.1 with up to 100 passes, session imported back.
 ² The remaining errors are "starved thermal" reliefs on the ground pour (the hand-routed interf_u has two itself).
-³ Results vary between runs: an earlier run with the same settings left 14 open on this board.
+³ Results vary between runs (Freerouting's passes depend on timing): earlier runs left 1 open on multichannel and 6 or 14 on coldfire.
 
 Measured on Windows 10, KiCad 10.0, 4 seeds × 20 min, 16 cores. `tinytapeout-demo` is left out:
 KiCad's Python API does not load it within 15 minutes on this machine.
@@ -55,7 +56,7 @@ KiCad's Python API does not load it within 15 minutes on this machine.
 | export + rule fix | Specctra export, then corrected: via sizes raised to the board's minimum diameter/drill/annular ring, net-class widths/clearances raised to the board minimums, custom `.kicad_dru` clearance rules (net-name wildcards, net classes) turned into router classes, placement rooms that forbid nothing no longer exported as keepouts |
 | route | Freerouting on N item-order seeds in parallel, stopping when passes stop improving |
 | score | every result is imported into KiCad, zones refilled, KiCad DRC; ranked by unconnected, errors, vias, length |
-| finish | for the best candidates: drop necked/dangling/offending items, last-mile router for what is open (shortest first, own clearance checks incl. copper text), vias for cut-off pour islands, silkscreen clean-up; repeated a few rounds |
+| finish | for the best candidates: drop necked/dangling/offending items, last-mile router for what is open, vias for cut-off pour islands, silkscreen clean-up; repeated a few rounds. The last-mile router works on a grid with its own clearance checks (copper text included), prefers straight runs with 45°/90° corners, joins cut-off pads to the nearest piece of their pour, retries tight passages on a finer grid, and can rip up a few unlocked tracks of other nets and route them again (undone unless everything fits) |
 | report | `result/<board>.kicad_pcb`, `report.json`, optional 3D renders |
 
 ## Install
@@ -112,7 +113,12 @@ python benchmark/run_benchmark.py                                  # pipeline on
 python benchmark/run_benchmark.py --standard path/to/freerouting-2.4.1.jar   # plus the plugin workflow
 ```
 
-Results land in `benchmark/results/<date>/results.md`.
+Results land in `benchmark/results/<date>/results.md`. A side-by-side view of the hand-routed and the
+routed boards (self-contained HTML with the copper layers embedded):
+
+```bash
+python benchmark/compare_views.py benchmark/results/<date>
+```
 
 ## Freerouting changes
 

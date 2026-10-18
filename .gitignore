@@ -7,4 +7,4 @@ autoroute-*/
 benchmark/results/
 tools/
 .venv/
-benchmark_run.log
+benchmark_run*.log
