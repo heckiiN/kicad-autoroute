@@ -178,9 +178,29 @@ def layer_costs(path: str, main: str, factor: float) -> None:
     Path(path).write_text(dsn.dumps(tree) + "\n", encoding="latin-1")
 
 
+def drop_outer_planes(tree) -> list[str]:
+    """Pours on the outer layers are not planes: traces on the same layer cut them apart, so pads
+    the router believed joined by the pour end up loose. Only inner-layer planes stay planes; nets
+    on outer pours get routed like any other net (the pour is still filled afterwards)."""
+    structure = dsn.child(tree, "structure")
+    layers = [dsn.atoms(l)[1] for l in dsn.children(structure, "layer")]
+    outer = {layers[0], layers[-1]} if layers else set()
+
+    def plane_layer(plane):
+        shape = next((c for c in plane if isinstance(c, list)), None)
+        atoms = dsn.atoms(shape) if shape is not None else []
+        return atoms[1] if len(atoms) > 1 else None
+
+    dropped = [f"{dsn.atoms(c)[1]} on {plane_layer(c)}" for c in structure
+               if dsn.head(c) == "plane" and plane_layer(c) in outer]
+    structure[:] = [c for c in structure if not (dsn.head(c) == "plane" and plane_layer(c) in outer)]
+    return [f"outer-layer pour {d} routed as a normal net (not a plane)" for d in dropped]
+
+
 def fix(dsn_path: str, board: str) -> list[str]:
     tree = dsn.read(dsn_path)
     notes = fix_vias(tree, ViaRules.for_board(board)) + fix_minimums(tree, board) + fix_clearances(tree, board)
+    notes += drop_outer_planes(tree)
     if notes:
         Path(dsn_path).write_text(dsn.dumps(tree) + "\n", encoding="latin-1")
     return notes

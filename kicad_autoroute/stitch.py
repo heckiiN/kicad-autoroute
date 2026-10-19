@@ -36,6 +36,8 @@ ap.add_argument("--edge", type=float, default=0.9, help="mm from via centre to b
 ap.add_argument("--skip-refs", default="", help="comma-separated references to skip (e.g. parts with thermal vias)")
 ap.add_argument("--skip-prefixes", default="H,TP,MH", help="reference prefixes to skip")
 ap.add_argument("--refs", default="", help="only treat these comma-separated references (local repair)")
+ap.add_argument("--share-reach", type=float, default=6.0,
+                help="2-layer boards: link a pad to plane-net copper within this many mm instead of a new via")
 ap.add_argument("--extra-clearance", action="append", default=[], help="NET=mm, e.g. HV_OUT=1.6")
 ns = ap.parse_args()
 VIA_RULES = ViaRules.for_board(ns.board)
@@ -122,7 +124,40 @@ def ok(cx, cy, own_pad, link_from, tw, base_clr, vd, layer):
     return True
 
 
-added, failed = 0, []
+def link_ok(a, c, tw, layer, skip_pads):
+    """A straight track from a to c on layer keeps its clearance to everything of other nets."""
+    link = samples(a, c, max(10, int(math.hypot(c[0] - a[0], c[1] - a[1]) / 0.2)))
+    for p, net, x0, y0, x1, y1 in pads:
+        if net == ns.net or p.m_Uuid.AsString() in skip_pads:
+            continue
+        if not p.IsOnLayer(layer):
+            continue
+        clr = need(net, own_clear)
+        if any(box_dist(px, py, x0, y0, x1, y1) < tw / 2 + clr for px, py in link):
+            return False
+    for net, tl, x1, y1, x2, y2, hw in tracks:
+        if net != ns.net and tl == layer and any(seg_dist(px, py, x1, y1, x2, y2) < tw / 2 + hw + need(net, own_clear)
+                                                 for px, py in link):
+            return False
+    for net, vx, vy, vr in vias:
+        if net != ns.net and any(math.hypot(px - vx, py - vy) < tw / 2 + vr + need(net, own_clear) for px, py in link):
+            return False
+    return True
+
+
+# Vias are a cost people avoid: a pad first tries a short straight track to copper of the net
+# that already reaches the pour (a through-hole pad, a via, a pad linked before), the way
+# neighbouring ground pins share one via.
+# next to a plane only close neighbours share (a decoupling capacitor beside its IC pin)
+share_reach = ns.share_reach if b.GetCopperLayerCount() <= 2 else min(ns.share_reach, 2.5)
+# 2-layer boards: a pad on a side that has a pour of the net is joined by that pour, no via needed
+poured = {l for z in b.Zones() if z.GetNetname() == ns.net and not z.GetIsRuleArea()
+          for l in z.GetLayerSet().Seq()} if b.GetCopperLayerCount() <= 2 else set()
+anchors = [(TO(p.GetPosition().x), TO(p.GetPosition().y), None, p) for f in b.GetFootprints() for p in f.Pads()
+           if p.GetNetname() == ns.net and p.GetAttribute() != pcbnew.PAD_ATTRIB_SMD]
+anchors += [(vx, vy, None, None) for net, vx, vy, _r in vias if net == ns.net]
+
+added, linked, failed = 0, 0, []
 for f in b.GetFootprints():
     ref = f.GetReference()
     if ref in skip_refs or ref.startswith(skip_prefixes):
@@ -139,6 +174,27 @@ for f in b.GetFootprints():
         bb = p.GetBoundingBox()
         hw, hh = TO(bb.GetWidth()) / 2, TO(bb.GetHeight()) / 2
         layer = p.GetPrincipalLayer()
+        if layer in poured:
+            continue
+        if share_reach > 0:
+            tw0 = ns.link_width if min(hw, hh) * 2 >= ns.fine_pad else ns.fine_link_width
+            near = sorted((math.hypot(ax - px, ay - py), ax, ay, al, ap) for ax, ay, al, ap in anchors
+                          if math.hypot(ax - px, ay - py) <= share_reach and (al is None or al == layer))
+            done_link = False
+            for _d, ax, ay, _al, ap in near:
+                skip = {p.m_Uuid.AsString()} | ({ap.m_Uuid.AsString()} if ap is not None else set())
+                if link_ok((px, py), (ax, ay), tw0, layer, skip):
+                    t = pcbnew.PCB_TRACK(b)
+                    t.SetStart(p.GetPosition()); t.SetEnd(pcbnew.VECTOR2I(FROM(ax), FROM(ay)))
+                    t.SetWidth(FROM(tw0)); t.SetLayer(layer); t.SetNet(net_item); t.SetLocked(True)
+                    b.Add(t)
+                    tracks.append((ns.net, layer, px, py, ax, ay, tw0 / 2))
+                    anchors.append((px, py, layer, p))
+                    linked += 1
+                    done_link = True
+                    break
+            if done_link:
+                continue
         base = math.atan2(py - fcy, px - fcx) if (px, py) != (fcx, fcy) else 0.0
         fine = min(hw, hh) * 2 < ns.fine_pad
         tw = ns.fine_link_width if fine else ns.link_width
@@ -162,6 +218,8 @@ for f in b.GetFootprints():
                     b.Add(t)
                     vias.append((ns.net, cx, cy, vd / 2))
                     tracks.append((ns.net, layer, px, py, cx, cy, tw / 2))
+                    anchors.append((cx, cy, None, None))
+                    anchors.append((px, py, layer, p))
                     added += 1
                     placed = True
                     break
@@ -171,4 +229,4 @@ for f in b.GetFootprints():
             failed.append(f"{ref}.{p.GetNumber()}")
 
 b.Save(ns.board)
-print(f"{ns.net} stitching vias added: {added}; no room for: {failed}")
+print(f"{ns.net} stitching vias added: {added}, pads linked to nearby {ns.net} copper: {linked}; no room for: {failed}")

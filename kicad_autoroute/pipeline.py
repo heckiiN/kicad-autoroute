@@ -118,7 +118,8 @@ def drc_all(pcb: Path) -> Path:
     return report
 
 
-def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, rounds: int = 4) -> list[str]:
+def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, rounds: int = 6,
+           buses_json: Path | None = None) -> list[str]:
     """Close what the router left: replace necked tracks, last-mile route open connections, drop
     dangling leftovers and too-close vias, repeat; then clean up the silkscreen."""
     notes = []
@@ -140,9 +141,31 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
         notes.append(steps("drop_close_vias", pcb, full))
         notes.append(steps("drop_offenders", pcb, full))
         notes.append(kpy(HERE / "zone_stitch.py", pcb, timeout=1500, fatal=False))
+        thermal = [{"items": v.get("items", []), "thermal": True} for v in data.get("violations", [])
+                   if v.get("type") == "starved_thermal"]
+        if thermal:
+            # pads whose thermal relief does not reach the pour: short tracks into the main pour
+            req = pcb.with_name(pcb.stem + "_thermal.json")
+            req.write_text(json.dumps({"unconnected_items": thermal}), encoding="utf-8")
+            notes.append(kpy(HERE / "lastmile.py", pcb, req, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
         islands = pcb.with_name(pcb.stem + "_islands.json")
         if islands.exists() and json.loads(islands.read_text(encoding="utf-8")).get("unconnected_items"):
             notes.append(kpy(HERE / "lastmile.py", pcb, islands, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+    # clean-up a person would do: re-route nets with vias where fewer vias suffice; kept only if the
+    # board is not worse afterwards (open connections, DRC errors)
+    # clean-up a person would do, each kept only if the board is not worse afterwards (open
+    # connections, DRC errors): buses re-laid as bundles, then nets re-routed with fewer vias
+    passes = [("rebundle", [buses_json, "--rebundle"])] if buses_json and buses_json.exists() else []
+    passes.append(("reduce_vias", ["--reduce-vias"]))
+    for label, args in passes:
+        before = drc(pcb)
+        backup = pcb.with_name(pcb.stem + f"_before_{label}.kicad_pcb")
+        shutil.copyfile(pcb, backup)
+        notes.append(kpy(HERE / "lastmile.py", pcb, *args, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+        after = drc(pcb)
+        if (after["unconnected"], after["error_count"]) > (before["unconnected"], before["error_count"]):
+            shutil.copyfile(backup, pcb)
+            notes.append(f"{label}: undone (board got worse)")
     silk_args = [pcb, "--original", original] + (["--texts-from-original"] if texts_from_original else [])
     notes.append(kpy(HERE / "silk_fix.py", *silk_args))
     return notes
@@ -170,10 +193,32 @@ def off_share(r: dict, main_layer: str | None) -> float:
     return round(1 - lengths.get(main_layer, 0.0) / total, 1)
 
 
+def bus_parallel(pcb: Path, buses_json: Path) -> float:
+    """Share of bus track length running alongside its neighbour (0 when the board has no buses)."""
+    if not buses_json.exists():
+        return 0.0
+    try:
+        return json.loads(kpy(HERE / "buses.py", pcb, "--json", fatal=False).splitlines()[-1]).get("parallel") or 0.0
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def rank_key(r: dict):
-    """Fewest open connections, then DRC errors, vias, copper off the main layer (people keep 2-layer
-    boards mostly on one side), length."""
-    return (r["unconnected"], r["error_count"], r["vias"], r.get("off_share", 0.0), r["track_mm"])
+    """Fewest open connections, then DRC errors, then buses laid as bundles (parallel share in steps
+    of 10 %), vias, copper off the main layer (people keep 2-layer boards mostly on one side), length."""
+    return (r["unconnected"], r["error_count"], -round(r.get("parallel", 0.0), 1), r["vias"],
+            r.get("off_share", 0.0), r["track_mm"])
+
+
+def select_best(results: list[dict]) -> dict:
+    """The result a person would keep: among the most complete ones (open, then DRC errors), any
+    with at most 20 % (+2) more vias than the fewest count as equal; among those the tidiest wins
+    (buses in bundles, copper on the main side), then fewer vias, then length."""
+    top = min((r["unconnected"], r["error_count"]) for r in results)
+    complete = [r for r in results if (r["unconnected"], r["error_count"]) == top]
+    fewest = min(r["vias"] for r in complete)
+    fair = [r for r in complete if r["vias"] <= 1.2 * fewest + 2]
+    return min(fair, key=lambda r: (-round(r.get("parallel", 0.0), 1), r.get("off_share", 0.0), r["vias"], r["track_mm"]))
 
 
 def pick_candidates(scored: list[dict], n: int) -> list[dict]:
@@ -182,14 +227,14 @@ def pick_candidates(scored: list[dict], n: int) -> list[dict]:
     up cleaner after it."""
     ranked = sorted(scored, key=rank_key)
     picked, variants = [], set()
-    # a variant that leaves many more connections open is not worth finishing: the last-mile router
-    # would spend its whole budget on it
-    reach = ranked[0]["unconnected"] + 3 if ranked else 0
+    # a variant that leaves many more connections open is not worth finishing (the last-mile router
+    # would spend its whole budget on it); a few more are fine, styles often finish cleaner
+    reach = ranked[0]["unconnected"] + 6 if ranked else 0
     for r in ranked:
         if r["unconnected"] > reach:
             continue
         stem = Path(r["ses"]).stem
-        variant = "_1L" if stem.endswith("_1L") else "_main" if stem.endswith("_main") else ""
+        variant = next((t for t in ("_1L", "_main", "_bus") if stem.endswith(t)), "")
         if variant not in variants:
             variants.add(variant)
             picked.append(r)
@@ -285,6 +330,19 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     dsn.parent.mkdir(parents=True, exist_ok=True)
     log(steps("export", pre, dsn))
 
+    # buses (runs of nets between two parts, found in the netlist) are laid as parallel bundles on a
+    # copy of the board before Freerouting routes the rest; a routing variant like the layer styles
+    bus_pre, dsn_bus, buses_json = None, None, work / "route" / "buses.json"
+    if cfg.get("buses", {}).get("enabled", True):
+        found = json.loads(kpy(HERE / "buses.py", pre, "--json").splitlines()[-1])
+        if found["buses"]:
+            buses_json.write_text(json.dumps(found), encoding="utf-8")
+            bus_pre = copy_project(pre, work / "board_bus", name)
+            log(kpy(HERE / "lastmile.py", bus_pre, buses_json, "--buses", "--min-width", min_track_width(pro, dru),
+                    timeout=1800, fatal=False))
+            dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
+            log(steps("export", bus_pre, dsn_bus))
+
     # 7: route
     fr = cfg.get("freerouting", {})
     extra = list(fr.get("args", []))
@@ -297,6 +355,10 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
         for flag in ("--router.autorouter.fallback_strategies=none", "--router.autorouter.residual_repair_max_open=0"):
             if not any(flag.split("=")[0] in a for a in extra):
                 extra.append(flag)
+    # vias cost more than Freerouting's default (50): routes stay in their layer, and on dense boards
+    # this even leaves fewer connections open (coldfire: 18 instead of 23 open, 291 instead of 335 vias)
+    if fr.get("via_costs", 120) and not any("via_costs" in a for a in extra):
+        extra.append(f"--router.scoring.via_costs={fr.get('via_costs', 120)}")
     min_w_um = int(round(min_track_width(pro, dru) * 1000))
     if fr.get("min_trace_width", True) and not any("min_trace_width" in a for a in extra):
         extra.append(f"--router.min_trace_width_um={min_w_um}")
@@ -308,7 +370,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     pref = json.loads(steps("layer_pref", pre, cfg.get("stitch", {}).get("net", "GND")).splitlines()[-1])
     main_layer = pref["layer"] if pref["copper_layers"] == 2 else None
     if main_layer and seeds >= 3:
-        cost = fr.get("other_layer_cost", 2.0)
+        cost = fr.get("other_layer_cost", 3.0)
         if cost > 1.0:
             weighted = dsn.with_name(dsn.stem + "_main.dsn")
             shutil.copyfile(dsn, weighted)
@@ -319,15 +381,22 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
             dsn_fix.single_layer(str(dsn), str(single), main_layer)
             dsns.append((single, "_1L"))
         log(f"2-layer variants: {', '.join(t or 'plain' for _p, t in dsns)} (main layer {main_layer}, {pref['side']})")
-    # half of all runs use the plain variant (it gets furthest on hard boards), the rest alternate
-    # between the styles
-    pattern = [0, 1, 0, 2] if len(dsns) == 3 else [0, 1] if len(dsns) == 2 else [0]
+    if dsn_bus is not None:
+        dsns.append((dsn_bus, "_bus"))
+    # the plain variant gets most runs (it gets furthest on hard boards): half of them, and three in
+    # four when there is only one other variant; the others alternate
+    others = list(range(1, len(dsns)))
+    pattern = [0, 0, 0, others[0]] if len(others) == 1 else [v for other in others for v in (0, other)] or [0]
 
     def make_jobs(first, last):
         out = []
         for s in range(first, last):
             path, tag = dsns[pattern[s % len(pattern)]]
-            out.append((path, f"s{s}{tag}", extra + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"])))
+            args = list(extra)
+            if tag in ("_main", "_1L"):
+                # the layer styles already shape the routes; with dear vias on top they over-constrain
+                args = [a for a in args if "via_costs" not in a]
+            out.append((path, f"s{s}{tag}", args + ([] if s == 0 else [f"--router.autorouter.item_order_seed={s}"])))
         return out
     workers, timeout = fr.get("workers", 4), fr.get("timeout", "00:15:00")
     log(f"routing {seeds} seeds, {workers} in parallel, timeout {timeout}")
@@ -348,8 +417,10 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     post = zones.get("post", [])
     scored = []
     for ses in sorted((work / "route").glob("*.ses")):
-        r = score_session(pre, ses, work / "score" / ses.stem, post, min_w)
+        base = bus_pre if ses.stem.endswith("_bus") and bus_pre else pre
+        r = score_session(base, ses, work / "score" / ses.stem, post, min_w)
         r["off_share"] = off_share(r, main_layer)
+        r["parallel"] = bus_parallel(Path(r["board"]), buses_json)
         log(f"{ses.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} "
             f"track_mm={r['track_mm']}")
         scored.append(r)
@@ -362,14 +433,16 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     finished = []
     for cand in pick_candidates(scored, finish_cfg.get("candidates", 2)):
         pcb = Path(cand["board"])
-        notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False))
+        notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False),
+                       buses_json=buses_json)
         r = drc(pcb)
         r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
         r["off_share"] = off_share(r, main_layer)
+        r["parallel"] = bus_parallel(pcb, buses_json)
         r.update({"ses": cand["ses"], "board": str(pcb), "notes": notes, "raw": {k: cand[k] for k in ("unconnected", "errors", "vias", "track_mm")}})
         log(f"finished {pcb.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} track_mm={r['track_mm']}")
         finished.append(r)
-    best = min(finished, key=rank_key)
+    best = select_best(finished)
 
     # 10: result + report
     result_dir = work / "result"

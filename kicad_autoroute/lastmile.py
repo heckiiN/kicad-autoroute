@@ -28,7 +28,7 @@ from kicad_classes import NetClasses, ViaRules  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("board")
-ap.add_argument("drc")
+ap.add_argument("drc", nargs="?", help="KiCad DRC report (JSON) with the unconnected items to route")
 ap.add_argument("--window", type=float, default=5.0)
 ap.add_argument("--grid", type=float, default=0.05)
 ap.add_argument("--min-width", type=float, default=0.15)
@@ -39,10 +39,21 @@ ap.add_argument("--bend-cost", type=float, default=0.5, help="cost of each 45 de
 ap.add_argument("--hole-clearance", type=float, default=0.25, help="min gap between drill holes")
 ap.add_argument("--max-span", type=float, default=0.0, help="skip connections longer than this (mm), 0 = no limit")
 ap.add_argument("--max-expansions", type=int, default=400000, help="search nodes per connection before giving up")
+ap.add_argument("--reduce-vias", action="store_true",
+                help="clean-up mode: re-route every net that has vias with a high via cost, keep it if it needs fewer")
 ap.add_argument("-v", "--verbose", action="store_true", help="explain failed connections")
 ap.add_argument("--max-rip", type=int, default=6, help="tracks a blocked connection may rip up (0: no rip-up)")
 ap.add_argument("--max-rip-nets", type=int, default=2, help="nets whose tracks a rip-up may move")
 ap.add_argument("--rip-cost", type=float, default=1.0, help="cost of crossing a rippable track, mm of trace per grid cell")
+ap.add_argument("--buses", action="store_true",
+                help="bus mode: the JSON (from buses.py) lists buses; route each as a parallel bundle and lock it")
+ap.add_argument("--rebundle", action="store_true",
+                help="clean-up mode: the JSON (from buses.py) lists buses; re-route each routed bus as a bundle "
+                     "and keep it when it runs more parallel without losing connections")
+ap.add_argument("--unlocked", action="store_true",
+                help="bus mode: leave the bundles unlocked, so the autorouter may still move single tracks")
+ap.add_argument("--lane-discount", type=float, default=0.4,
+                help="cost factor for running alongside the previous net of a bus")
 ap.add_argument("--max-cells", type=float, default=600000, help="grid cells per layer before the grid gets coarser")
 ap.add_argument("--time-budget", type=float, default=900.0,
                 help="seconds for all connections together; short connections go first")
@@ -57,7 +68,9 @@ extra = NetClasses.dru_net_clearances(ns.board)
 layers = [l for l in range(pcbnew.PCB_LAYER_ID_COUNT) if pcbnew.IsCopperLayer(l) and b.IsLayerEnabled(l)]
 ebb = b.GetBoardEdgesBoundingBox()
 EDGE = (TO(ebb.GetLeft()), TO(ebb.GetTop()), TO(ebb.GetRight()), TO(ebb.GetBottom()))
-report = json.load(open(ns.drc, encoding="utf-8"))
+report = json.load(open(ns.drc, encoding="utf-8")) if ns.drc else {}
+if any(u.get("thermal") for u in report.get("unconnected_items", [])):
+    pcbnew.ZONE_FILLER(b).Fill(b.Zones())   # thermal fixes read the current pour shapes
 
 
 @functools.lru_cache(maxsize=None)
@@ -222,9 +235,11 @@ def zone_target(zone, start, zone_layers):
     return (best[1], best[2]) if best else (None, None)
 
 
-def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), soft=False, fine=False):
+def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), soft=False, fine=False,
+          attract=None, pitch=0.0):
     """Grid A* from a to b_pt. With soft=True unlocked tracks of other nets are passable at a cost
-    (rip-up search); otherwise they block like everything else."""
+    (rip-up search); otherwise they block like everything else. attract: segments [(layer, x1, y1,
+    x2, y2)] of a neighbour (bus); cells at `pitch` from them are cheaper, so the path runs alongside."""
     # long connections search on a coarser grid (at most MAX_CELLS per layer); the clearance margin
     # grows with the grid step, so a coarse path is still legal
     w_mm = abs(a[0] - b_pt[0]) + 2 * ns.window
@@ -282,6 +297,25 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
     # flat byte maps: much faster to index in the inner loop than numpy arrays
     L = len(layers)
     hard = [tmaps[layers[k]].tobytes() for k in range(L)]
+    near = None
+    if attract:
+        # the lane next to the neighbour: centre distance pitch .. pitch + 1.5 grid steps
+        lanes = {l: np.zeros((ny, nx), bool) for l in layers}
+        for layer, sx, sy, ex, ey in attract:
+            if layer not in lanes:
+                continue
+            m = pitch + 1.5 * g
+            i0, i1 = max(0, int((min(sx, ex) - m - x0) / g)), min(nx, int((max(sx, ex) + m - x0) / g) + 2)
+            j0, j1 = max(0, int((min(sy, ey) - m - y0) / g)), min(ny, int((max(sy, ey) + m - y0) / g) + 2)
+            if i0 >= i1 or j0 >= j1:
+                continue
+            Xs, Ys = X[j0:j1, i0:i1], Y[j0:j1, i0:i1]
+            dx, dy = ex - sx, ey - sy
+            L2 = dx * dx + dy * dy
+            t = np.clip(((Xs - sx) * dx + (Ys - sy) * dy) / L2, 0, 1) if L2 > 0 else 0
+            d = np.hypot(Xs - (sx + t * dx), Ys - (sy + t * dy))
+            lanes[layer][j0:j1, i0:i1] |= (d >= pitch - 0.5 * g) & (d <= m)
+        near = [lanes[layers[k]].tobytes() for k in range(L)]
     soft = [smaps[layers[k]].tobytes() for k in range(L)] if smaps is not None else None
     vias = via_ok.tobytes()
 
@@ -297,6 +331,7 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
         while heap:
             expanded += 1
             if expanded > limit or (expanded % 5000 == 0 and time.time() > deadline):
+                say(f"  search {net}: gave up after {expanded} steps (grid {g:.3f} mm, {nx}x{ny})")
                 return None, prev
             f, d, node = heapq.heappop(heap)
             x, y, k, last = node
@@ -320,6 +355,8 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
                     continue
                 if sk is not None and sk[cell_]:
                     c += rip_cell
+                if near is not None and near[k][cell_]:
+                    c *= ns.lane_discount
                 nb = (nx_, ny_, k, i if directional else NONE)
                 nd = d + c
                 if nd < dist.get(nb, 1e18):
@@ -336,6 +373,7 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
                             dist[nb] = nd
                             prev[nb] = node
                             heapq.heappush(heap, (nd + weight * h(x, y), nd, nb))
+        say(f"  search {net}: no path, {expanded} steps exhausted the window (grid {g:.3f} mm, {nx}x{ny})")
         return None, prev
 
     found, prev = search(False, 1.0, ns.max_expansions)
@@ -526,8 +564,420 @@ def span(u):
     return math.hypot(its[0]["pos"]["x"] - its[1]["pos"]["x"], its[0]["pos"]["y"] - its[1]["pos"]["y"])
 
 
+def main_piece(zone, layer):
+    """The largest filled piece of a zone on a layer (the pour the rest of the net hangs on)."""
+    polys = zone.GetFilledPolysList(layer)
+    if polys.OutlineCount() == 0:
+        return None
+    i = max(range(polys.OutlineCount()), key=lambda k: polys.Outline(k).Area())
+    piece = pcbnew.SHAPE_POLY_SET()
+    piece.AddOutline(polys.Outline(i))
+    for h in range(polys.HoleCount(i)):
+        piece.AddHole(polys.Hole(i, h))
+    return piece
+
+
+def thermal_fix(u):
+    """A pad whose thermal relief does not reach the pour properly (too few spokes, or spokes into a
+    cut-off piece) gets short tracks into the main pour: KiCad counts a track into the zone as a
+    connection. Which case it is follows from the geometry, not from the report's wording."""
+    res = [resolve(i) for i in u.get("items", [])]
+    pad = next((r for r in res if r[0] == "PAD"), None)
+    zone = next((r for r in res if r[0] == "zone"), None)
+    if pad is None or zone is None or zone[4] is None:
+        return None
+    _k, net, pad_layers, a, pad_item = pad
+    zone_item = zone[4]
+    layers_ = [l for l in zone[2] if l in pad_layers]
+    if not layers_:
+        return None
+    layer = layers_[0]
+    bb = pad_item.GetBoundingBox()
+    reach = max(TO(bb.GetWidth()), TO(bb.GetHeight())) / 2 + TO(zone_item.GetThermalReliefGap()) + 0.6
+    # the fill piece around the pad: when it also holds other copper of the net it is a real part of
+    # the pour and only needs another spoke; when the pad is alone in it, it is a cut-off island and
+    # the stubs go to the main pour
+    fill = zone_item.GetFilledPolysList(layer)
+    own = None
+    for i in range(fill.OutlineCount()):
+        cand = pcbnew.SHAPE_POLY_SET()
+        cand.AddOutline(fill.Outline(i))
+        for h in range(fill.HoleCount(i)):
+            cand.AddHole(fill.Hole(i, h))
+        if any(cand.Contains(pcbnew.VECTOR2I(FROM(a[0] + reach * math.cos(math.radians(k * 45))),
+                                             FROM(a[1] + reach * math.sin(math.radians(k * 45))))) for k in range(8)):
+            own = cand
+            break
+    others = [o.GetPosition() for f in b.GetFootprints() for o in f.Pads()
+              if o.GetNetname() == net and o.IsOnLayer(layer) and o.m_Uuid.AsString() != pad_item.m_Uuid.AsString()]
+    others += [t.GetPosition() for t in b.GetTracks() if t.GetClass() == "PCB_VIA" and t.GetNetname() == net]
+    island = own is None or not any(own.Contains(o) for o in others)
+    piece = main_piece(zone_item, layer) if island else own
+    if piece is None:
+        return None
+    # KiCad counts a track into the pour like a spoke, and wants min_resolved_spokes (normally 2)
+    # connections to the main pour. The relief's own spokes run at the spoke angle + k * 90 deg, so
+    # stubs go between them: per direction the nearest point of the main pour, then the two closest
+    # directions at least 90 deg apart.
+    try:
+        spoke = float(pad_item.GetThermalSpokeAngle().AsDegrees())
+    except Exception:
+        spoke = 0.0
+    hits = {}
+    r = reach
+    while r < reach + 20 and len(hits) < 16:
+        for k in range(16):
+            ang = k * 22.5
+            if ang in hits:
+                continue
+            q = (a[0] + r * math.cos(math.radians(ang)), a[1] + r * math.sin(math.radians(ang)))
+            if piece.Contains(pcbnew.VECTOR2I(FROM(q[0]), FROM(q[1]))):
+                hits[ang] = (r, q)
+        r += 0.5
+
+    def on_spoke(ang):
+        return min(abs((ang - spoke) % 90), 90 - abs((ang - spoke) % 90)) < 10
+
+    order = sorted(hits, key=lambda ang: (round(hits[ang][0], 1), on_spoke(ang)))
+    candidates = [(ang, hits[ang][1]) for ang in order]
+    near, _l = zone_target(zone_item, a, [layer]) if island else (None, None)
+    if near is not None:   # the closest point of the main pour, wherever it is
+        candidates.insert(0, (math.degrees(math.atan2(near[1] - a[1], near[0] - a[0])) % 360, near))
+    made, used = 0, []
+    for ang, q in candidates:
+        if made == 2 or time.time() > t_start + ns.time_budget:
+            break
+        if any(min((ang - t) % 360, (t - ang) % 360) < 90 for t in used):
+            continue
+        for w in sorted({classes.width(net), max(ns.min_width, 0.1)}, reverse=True):
+            path = route(net, a, q, [layer], [layer], w, goal_radius=0.25, deadline=t_start + ns.time_budget)
+            say(f"thermal {net} {a}: stub towards {ang:.0f} deg {tuple(round(v, 2) for v in q)} w {w}: {'ok' if path else 'no path'}")
+            if path and insert(net, path, w):
+                made += 1
+                used.append(ang)
+                break
+    return made
+
+
+def open_connections():
+    """Unconnected count after refilling the pours (a re-routed net can cut a pour apart)."""
+    pcbnew.ZONE_FILLER(b).Fill(b.Zones())
+    b.BuildConnectivity()
+    conn = b.GetConnectivity()
+    conn.RecalculateRatsnest()
+    return conn.GetUnconnectedCount(False)
+
+
+def reduce_vias(max_pads=8, via_cost_mm=12.0):
+    """Clean-up pass a person would do: every small net that uses vias is taken up and routed again
+    pad to pad (minimum spanning tree) with a high via cost. The new route is kept only when it is
+    complete, uses fewer vias and is not much longer; otherwise the old one is put back."""
+    kept = []
+    nets = {}
+    for t in b.GetTracks():
+        if not t.IsLocked() and t.GetNetname():
+            nets.setdefault(t.GetNetname(), []).append(t)
+    pads_of = {}
+    for f in b.GetFootprints():
+        for p in f.Pads():
+            if p.GetNetname():
+                pads_of.setdefault(p.GetNetname(), []).append(p)
+    order = sorted(nets, key=lambda n: -sum(t.GetClass() == "PCB_VIA" for t in nets[n]))
+    saved_cost = ns.via_cost
+    baseline = open_connections()
+    for net in order:
+        if time.time() > t_start + ns.time_budget:
+            break
+        old = nets[net]
+        vias_before = sum(t.GetClass() == "PCB_VIA" for t in old)
+        pads = pads_of.get(net, [])
+        if vias_before == 0 or not 2 <= len(pads) <= max_pads:
+            continue
+        length_before = sum(t.GetLength() for t in old if t.GetClass() != "PCB_VIA") / 1e6
+        # take the net up (board and obstacle model)
+        ids = {o.m_Uuid.AsString() for o in old}
+        removed_items = [(i, it) for i, it in enumerate(items) if it is not None and it[0] == net and it[2] in ("seg", "disc")]
+        for i, _it in removed_items:
+            items[i] = None
+        for o in old:
+            b.Remove(o)
+        n_items, n_holes = len(items), len(holes)
+        # minimum spanning tree over the pads
+        pts = [((TO(p.GetPosition().x), TO(p.GetPosition().y)), [l for l in layers if p.IsOnLayer(l)]) for p in pads]
+        in_tree, edges = {0}, []
+        while len(in_tree) < len(pts):
+            i, j = min(((i, j) for i in in_tree for j in range(len(pts)) if j not in in_tree),
+                       key=lambda e: math.hypot(pts[e[0]][0][0] - pts[e[1]][0][0], pts[e[0]][0][1] - pts[e[1]][0][1]))
+            edges.append((i, j))
+            in_tree.add(j)
+        ns.via_cost = via_cost_mm
+        new = []
+        ok = True
+        for i, j in edges:
+            path = None
+            for w in sorted({classes.width(net), max(ns.min_width, 0.1)}, reverse=True):
+                path = route(net, pts[i][0], pts[j][0], pts[i][1], pts[j][1], w, 0.0, t_start + ns.time_budget)
+                if path:
+                    new += insert(net, path, w)
+                    break
+            if not path:
+                ok = False
+                break
+        ns.via_cost = saved_cost
+        vias_after = sum(o.GetClass() == "PCB_VIA" for o in new)
+        length_after = sum(o.GetLength() for o in new if o.GetClass() != "PCB_VIA") / 1e6
+        if ok and vias_after < vias_before and length_after <= 1.5 * length_before + 5:
+            now = open_connections()
+            if now <= baseline:
+                baseline = now
+                kept.append(f"{net} vias {vias_before}->{vias_after}")
+                continue
+        for o in new:
+            b.Delete(o)
+        for i in range(n_items, len(items)):
+            items[i] = None
+        del holes[n_holes:]
+        for o in old:
+            b.Add(o)
+        for i, it in removed_items:
+            items[i] = it
+    open_connections()   # leave the pours filled for the old routes that came back
+    return kept
+
+
+def route_buses(bus_data):
+    """Lay every bus as a bundle: its nets in pin order, each one drawn to the lane right next to
+    the previous one. The bundles are locked, so the autorouter routes around them."""
+    pad_of = {}
+    for f in b.GetFootprints():
+        for p in f.Pads():
+            if p.GetNetname():
+                pad_of[(f.GetReference(), p.GetNetname())] = p
+    report_lines = []
+
+    def ends(bus, net):
+        pa, pb = pad_of.get((bus["from"], net)), pad_of.get((bus["to"], net))
+        if pa is None or pb is None:
+            return None
+        return ((TO(pa.GetPosition().x), TO(pa.GetPosition().y)), [l for l in layers if pa.IsOnLayer(l)],
+                (TO(pb.GetPosition().x), TO(pb.GetPosition().y)), [l for l in layers if pb.IsOnLayer(l)])
+
+    def span_of(bus):
+        e = [ends(bus, n) for n in bus["nets"]]
+        e = [x for x in e if x]
+        return sum(math.hypot(x[0][0] - x[2][0], x[0][1] - x[2][1]) for x in e) / max(1, len(e))
+
+    # short buses first: they are local, almost always fit, and leave the long ones the most room;
+    # a bus that cannot be laid completely is taken up again and left to the autorouter
+    for bus in sorted(bus_data.get("detail", []), key=span_of):
+        if time.time() > t_start + ns.time_budget:
+            break
+        n_items, n_holes = len(items), len(holes)
+        prev, prev_net, laid = None, None, []
+        for net in bus["nets"]:
+            e = ends(bus, net)
+            if e is None:
+                laid = None
+                break
+            a_, la_, b_, lb_ = e
+            w = classes.width(net)
+            pitch = w + need(net, prev_net) if prev_net else 0.0
+            path = route(net, a_, b_, la_, lb_, w, 0.0, t_start + ns.time_budget, attract=prev, pitch=pitch)
+            if not path:
+                say(f"bus {bus['from']}->{bus['to']}: {net} does not fit, bus left to the autorouter")
+                laid = None if not laid else laid + [None]
+                break
+            new = insert(net, path, w)
+            laid += new
+            prev = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y))
+                    for o in new if o.GetClass() == "PCB_TRACK"]
+            prev_net = net
+        if laid and None not in laid:
+            for o in laid:
+                o.SetLocked(not ns.unlocked)
+            report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets'])} nets")
+        else:
+            for o in (laid or []):
+                if o is not None:
+                    b.Delete(o)
+            for i in range(n_items, len(items)):
+                items[i] = None
+            del holes[n_holes:]
+    return report_lines
+
+
+def rebundle(bus_data):
+    """Clean-up for a routed board: every bus whose nets join just its two parts is taken up and
+    routed again as a bundle (each net in the lane next to the previous one). Kept only when the bus
+    runs clearly more parallel and no connection is lost; otherwise the old routes come back."""
+    import buses as bus_tools
+    kept = []
+    pad_of, net_pads = {}, {}
+    for f in b.GetFootprints():
+        for p in f.Pads():
+            if p.GetNetname():
+                pad_of[(f.GetReference(), p.GetNetname())] = p
+                net_pads.setdefault(p.GetNetname(), []).append(p)
+
+    def where(p):
+        return (TO(p.GetPosition().x), TO(p.GetPosition().y)), [l for l in layers if p.IsOnLayer(l)]
+    baseline = open_connections()
+    for bus in bus_data.get("detail", []):
+        if time.time() > t_start + ns.time_budget:
+            break
+        nets = [n for n in bus["nets"] if 2 <= len(net_pads.get(n, [])) <= 4
+                and (bus["from"], n) in pad_of and (bus["to"], n) in pad_of]
+        if len(nets) < 3:
+            continue
+        sub_bus = dict(bus, nets=nets)
+        before, _len = bus_tools.parallelism(b, sub_bus)
+        old = [t for t in b.GetTracks() if t.GetNetname() in nets and not t.IsLocked()]
+        if not old:
+            continue
+        removed_items = [(i, it) for i, it in enumerate(items) if it is not None and it[0] in nets and it[2] in ("seg", "disc")]
+        for i, _it in removed_items:
+            items[i] = None
+        for o in old:
+            b.Remove(o)
+        n_items, n_holes = len(items), len(holes)
+        new, prev, prev_net, ok = [], None, None, True
+        for net in nets:
+            pa, pb = pad_of[(bus["from"], net)], pad_of[(bus["to"], net)]
+            a_ = (TO(pa.GetPosition().x), TO(pa.GetPosition().y))
+            b_ = (TO(pb.GetPosition().x), TO(pb.GetPosition().y))
+            w = classes.width(net)
+            path = route(net, a_, b_, [l for l in layers if pa.IsOnLayer(l)], [l for l in layers if pb.IsOnLayer(l)],
+                         w, 0.0, t_start + ns.time_budget, attract=prev, pitch=(w + need(net, prev_net)) if prev_net else 0.0)
+            if not path:
+                say(f"rebundle {bus['from']}->{bus['to']}: {net} finds no lane")
+                ok = False
+                break
+            made = insert(net, path, w)
+            new += made
+            prev = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y))
+                    for o in made if o.GetClass() == "PCB_TRACK"]
+            prev_net = net
+            # the net's other pads (a pull-up, a second part) join the nearest pad already connected
+            joined = [pa, pb]
+            for extra_pad in [q for q in net_pads[net] if q.m_Uuid.AsString() not in
+                              {pa.m_Uuid.AsString(), pb.m_Uuid.AsString()}]:
+                (xa, la_), = [where(extra_pad)]
+                target = min(joined, key=lambda q: math.hypot(where(q)[0][0] - xa[0], where(q)[0][1] - xa[1]))
+                xt, lt = where(target)
+                branch = route(net, xa, xt, la_, lt, w, 0.0, t_start + ns.time_budget)
+                if not branch:
+                    ok = False
+                    break
+                new += insert(net, branch, w)
+                joined.append(extra_pad)
+            if not ok:
+                break
+        if ok:
+            after, _len = bus_tools.parallelism(b, sub_bus)
+            say(f"rebundle {bus['from']}->{bus['to']} ({len(nets)} nets): parallel {before:.2f} -> {after:.2f}")
+            if after >= before + 0.1:
+                now = open_connections()
+                say(f"  open connections {baseline} -> {now}")
+                if now <= baseline:
+                    baseline = now
+                    kept.append(f"{bus['from']}->{bus['to']} parallel {before:.2f}->{after:.2f}")
+                    continue
+        for o in new:
+            b.Delete(o)
+        for i in range(n_items, len(items)):
+            items[i] = None
+        del holes[n_holes:]
+        for o in old:
+            b.Add(o)
+        for i, it in removed_items:
+            items[i] = it
+    open_connections()
+    return kept
+
+
+if ns.rebundle:
+    kept = rebundle(report)
+    b.Save(ns.board)
+    print(f"rebundle: {len(kept)} buses laid as bundles {kept}")
+    sys.exit(0)
+
+if ns.buses:
+    lines = route_buses(report)
+    b.Save(ns.board)
+    print(f"buses: laid as bundles {lines}")
+    sys.exit(0)
+
+if ns.reduce_vias:
+    kept = reduce_vias()
+    b.Save(ns.board)
+    print(f"reduce_vias: {len(kept)} nets with fewer vias {kept}")
+    sys.exit(0)
+
+def connect_pieces(zone):
+    """KiCad reports a zone as unconnected to itself when pieces of its fill do not touch. Every
+    piece that holds pads of the net but is not the main piece is tied to the main piece: a track
+    from one of its pads to the nearest point of the main pour."""
+    net = zone.GetNetname()
+    made = 0
+    baseline = open_connections()
+    for layer in [l for l in zone.GetLayerSet().Seq() if l in layers]:
+        fill = zone.GetFilledPolysList(layer)
+        if fill.OutlineCount() < 2:
+            continue
+        main = max(range(fill.OutlineCount()), key=lambda k: fill.Outline(k).Area())
+        for i in range(fill.OutlineCount()):
+            if i == main:
+                continue
+            piece = pcbnew.SHAPE_POLY_SET()
+            piece.AddOutline(fill.Outline(i))
+            # copper of the net in this piece: pads, vias, track ends (start points for the tie)
+            inside = [(p.GetPosition(), [l for l in layers if p.IsOnLayer(l)]) for f in b.GetFootprints()
+                      for p in f.Pads() if p.GetNetname() == net and p.IsOnLayer(layer)]
+            inside += [(t.GetPosition(), list(layers)) for t in b.GetTracks()
+                       if t.GetClass() == "PCB_VIA" and t.GetNetname() == net]
+            inside += [(pt, [layer]) for t in b.GetTracks() if t.GetClass() == "PCB_TRACK" and t.GetNetname() == net
+                       and t.GetLayer() == layer for pt in (t.GetStart(), t.GetEnd())]
+            inside = [(pos, ls) for pos, ls in inside if piece.Contains(pos)]
+            for pos, start_layers in inside[:1]:
+                a_ = (TO(pos.x), TO(pos.y))
+                q, _l = zone_target(zone, a_, [layer])
+                if q is None:
+                    continue
+                for w in sorted({classes.width(net), max(ns.min_width, 0.1)}, reverse=True):
+                    path = route(net, a_, q, start_layers, [layer], w, 0.3, t_start + ns.time_budget)
+                    if path:
+                        n_items, n_holes = len(items), len(holes)
+                        tie = insert(net, path, w)
+                        now = open_connections()
+                        if now < baseline:     # the piece really was cut off: keep the tie
+                            baseline = now
+                            made += 1
+                        else:                   # already joined through tracks: no extra copper
+                            for o in tie:
+                                b.Delete(o)
+                            for k in range(n_items, len(items)):
+                                items[k] = None
+                            del holes[n_holes:]
+                        break
+    return made
+
+
 seen_pairs = set()
+zones_joined = set()
 for u in sorted(report.get("unconnected_items", []), key=span):
+    kinds = [resolve(i) for i in u.get("items", [])[:2]]
+    if len(kinds) == 2 and kinds[0][0] == kinds[1][0] == "zone" and kinds[0][4] is not None:
+        zone = kinds[0][4]
+        if zone.m_Uuid.AsString() not in zones_joined:
+            zones_joined.add(zone.m_Uuid.AsString())
+            pcbnew.ZONE_FILLER(b).Fill(b.Zones())
+            n = connect_pieces(zone)
+            (done if n else failed).append(f"{zone.GetNetname()} pour pieces joined: {n}")
+        continue
+    if u.get("thermal"):
+        made = thermal_fix(u)
+        (done if made else failed).append(f"thermal relief {made or 0} stubs")
+        continue
     its = u.get("items", [])
     pair = tuple(sorted((round(i["pos"]["x"], 3), round(i["pos"]["y"], 3)) for i in its[:2]))
     if pair in seen_pairs:

@@ -31,7 +31,7 @@ min_class_width = 0.5   # only nets whose class width is at least this (mm)
 
 [stitch]
 enabled = "auto"        # vias from SMD pads of the plane net into its pour; auto = when the net exists
-net = "GND"
+net = "GND"             # on 2-layer boards a pad links to nearby ground copper first and shares vias
 # skip_refs = ["U4"]    # parts whose footprint already has thermal vias
 
 [zones]
@@ -40,10 +40,19 @@ net = "GND"
 # post = [{ net = "GND", layers = ["F.Cu", "In2.Cu", "B.Cu"] }]  # pours added after routing
 post_as_planes = true   # tell the router about post-route pours already (faster, it stops earlier)
 
+[buses]
+enabled = true          # buses (runs of nets between two parts, found in the netlist) laid as parallel
+                        # bundles before routing; a routing variant, chosen only when it is as complete
+
 [freerouting]
 seeds = 4               # runs with different item orders; the best one wins
 workers = 4             # runs in parallel; each JVM may use up to 2 GB
 timeout = "00:20:00"    # per run
+quick_wave_s = 120      # while a wave of runs takes less than this, more seeds are added ...
+max_seeds = 12          # ... up to this many
+single_layer = true     # 2-layer boards: also try single-sided routing (jumpers added when finishing)
+other_layer_cost = 3.0  # 2-layer boards: also try with traces on the second side this much dearer
+via_costs = 120         # Freerouting via cost (its default is 50); higher keeps routes in their layer
 max_passes = 100
 stop_at_stagnation = true   # stop when passes stop improving; the finishing pass closes the rest
 min_trace_width = true      # pass the board's minimum track width to the router

@@ -106,3 +106,13 @@ def test_layer_costs(tmp_path):
              for r in dsn.children(settings, "layer_rule")}
     assert costs == {"F.Cu": 2.0, "B.Cu": 1.0}
     assert dsn.atoms(dsn.child(settings, "postroute")) == ["postroute", "off"]
+
+
+def test_outer_layer_pours_are_not_planes(project, tmp_path):
+    text = DSN.replace('(via "Via[0-1]_600:300_um")\n',
+                       '(via "Via[0-1]_600:300_um")\n    (plane GND (polygon B.Cu 0 0 0 1000 0 1000 1000 0 0))\n', 1)
+    path = tmp_path / "t.dsn"
+    path.write_text(text, encoding="latin-1")
+    notes = dsn_fix.fix(str(path), str(project))
+    assert not dsn.children(dsn.child(dsn.read(path), "structure"), "plane")
+    assert any("GND on B.Cu" in n for n in notes)

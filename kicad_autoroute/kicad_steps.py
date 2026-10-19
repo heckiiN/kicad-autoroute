@@ -241,30 +241,29 @@ def stats(path):
 
 
 def layer_pref(path, plane_net):
-    """Layer for single-layer routing of a 2-layer board, as a human would pick it: the side with
-    most SMD pads; on an all through-hole board the side carrying the plane net's pour (else bottom)."""
+    """Main side for a 2-layer board, as people pick it: on a board that is mostly SMD the side
+    with most SMD pads; on a mostly through-hole board the solder side (opposite the parts), where
+    through-hole boards have always been routed."""
     b = pcbnew.LoadBoard(path)
     smd = {pcbnew.F_Cu: 0, pcbnew.B_Cu: 0}
+    parts = {pcbnew.F_Cu: 0, pcbnew.B_Cu: 0}
+    tht = 0
     for f in b.GetFootprints():
+        parts[pcbnew.B_Cu if f.IsFlipped() else pcbnew.F_Cu] += 1
         for p in f.Pads():
             if p.GetAttribute() == pcbnew.PAD_ATTRIB_SMD:
                 for l in smd:
                     if p.IsOnLayer(l):
                         smd[l] += 1
-    pour = {l: 0.0 for l in smd}
-    for z in b.Zones():
-        if z.GetNetname() == plane_net and not z.GetIsRuleArea():
-            for l in pour:
-                if z.GetLayerSet().Contains(l):
-                    pour[l] += 1
-    if any(smd.values()):
+            elif p.GetAttribute() == pcbnew.PAD_ATTRIB_PTH:
+                tht += 1
+    if sum(smd.values()) > tht:
         layer = max(smd, key=smd.get)
-    elif pour[pcbnew.F_Cu] and not pour[pcbnew.B_Cu]:
-        layer = pcbnew.F_Cu
     else:
-        layer = pcbnew.B_Cu
+        layer = pcbnew.B_Cu if parts[pcbnew.F_Cu] >= parts[pcbnew.B_Cu] else pcbnew.F_Cu
     print(json.dumps({"copper_layers": b.GetCopperLayerCount(), "layer": b.GetLayerName(layer),
-                      "side": "top" if layer == pcbnew.F_Cu else "bottom", "smd_pads": list(smd.values())}))
+                      "side": "top" if layer == pcbnew.F_Cu else "bottom", "smd_pads": list(smd.values()),
+                      "tht_pads": tht}))
 
 
 if __name__ == "__main__":

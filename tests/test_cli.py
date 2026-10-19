@@ -55,7 +55,7 @@ def test_work_dir_is_only_cleared_when_ours(tmp_path):
 def test_candidates_cover_every_variant_within_reach():
     def r(stem, unconnected, vias=0):
         return {"ses": f"{stem}.ses", "unconnected": unconnected, "error_count": 0, "vias": vias, "track_mm": 1.0}
-    scored = [r("b__s0", 1, 10), r("b__s3", 2, 5), r("b_main__s1_main", 3), r("b_1L__s2_1L", 9)]
+    scored = [r("b__s0", 1, 10), r("b__s3", 2, 5), r("b_main__s1_main", 3), r("b_1L__s2_1L", 12)]
     picked = [c["ses"] for c in pipeline.pick_candidates(scored, 2)]
     assert picked == ["b__s0.ses", "b_main__s1_main.ses"]   # single-layer leaves too much open
 
@@ -66,3 +66,13 @@ def test_off_share_ranks_main_layer_boards_first():
     for x in (clean, mixed):
         x["off_share"] = pipeline.off_share(x, "B.Cu")
     assert min([mixed, clean], key=pipeline.rank_key) is clean
+
+
+def test_select_best_trades_a_few_vias_for_a_tidy_board():
+    def r(vias, off, unconnected=0, parallel=0.0):
+        return {"unconnected": unconnected, "error_count": 0, "vias": vias, "off_share": off,
+                "parallel": parallel, "track_mm": 100.0}
+    fewest_vias, tidy, too_many, incomplete = r(4, 0.4), r(6, 0.2), r(20, 0.0), r(0, 0.0, unconnected=1)
+    assert pipeline.select_best([fewest_vias, tidy, too_many, incomplete]) is tidy
+    bundled = r(6, 0.4, parallel=0.8)
+    assert pipeline.select_best([fewest_vias, tidy, bundled]) is bundled
