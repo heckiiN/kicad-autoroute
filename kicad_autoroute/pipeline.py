@@ -246,7 +246,7 @@ def pick_candidates(scored: list[dict], n: int) -> list[dict]:
     reach = ranked[0]["unconnected"] + 6 if ranked else 0
     for r in ranked:
         stem = Path(r["ses"]).stem
-        variant = next((t for t in ("_1L", "_main", "_bus") if stem.endswith(t)), "")
+        variant = next((t for t in ("_1L", "_main", "_rebus", "_bus") if stem.endswith(t)), "")
         if r["unconnected"] > reach:
             continue
         if variant not in variants:
@@ -467,6 +467,31 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
         scored.append(r)
     if not scored:
         raise SystemExit("no routing result")
+
+    # buses re-laid on the best routed board: its bus nets are taken up and laid as bundles, which
+    # may push other nets aside; Freerouting then continues from that nearly complete board and
+    # routes only what was pushed aside (it is far better at that than at routing around bundles
+    # on an empty board)
+    plain = [r for r in scored if not Path(r["ses"]).stem.endswith(("_bus", "_1L", "_main"))]
+    if buses_json.exists() and plain and cfg.get("buses", {}).get("reroute", False):
+        top = min(plain, key=rank_key)
+        rebus = copy_project(Path(top["board"]), work / "board_rebus", name)
+        log(kpy(HERE / "lastmile.py", rebus, buses_json, "--buses", "--through", "--min-width", min_w,
+                "--max-cells", 200000, "--max-expansions", 1500000, "--time-budget", 1500,
+                *([] if cfg.get("buses", {}).get("lock", True) else ["--unlocked"]), timeout=1800, fatal=False))
+        dsn_rebus = dsn.with_name(dsn.stem + "_rebus.dsn")
+        log(steps("export", rebus, dsn_rebus))
+        n = fr.get("reroute_seeds", 2)
+        jobs = [(dsn_rebus, f"s{k}_rebus", extra + ([f"--router.autorouter.item_order_seed={k + 1}"] if k else []))
+                for k in range(n)]
+        router.run_matrix(jobs, min(workers, n), work / "route", timeout, fr.get("max_passes", 100), "rebus")
+        for ses in sorted((work / "route").glob("*_rebus.ses")):
+            r = score_session(rebus, ses, work / "score" / ses.stem, post, min_w)
+            r["off_share"] = off_share(r, main_layer)
+            r["parallel"] = bus_parallel(Path(r["board"]), buses_json)
+            log(f"{ses.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} "
+                f"track_mm={r['track_mm']} parallel={r['parallel']}")
+            scored.append(r)
     best = min(scored, key=rank_key)
 
     # 9: finish the best candidates (last mile, clean-up, silkscreen), keep the best finished board

@@ -44,6 +44,12 @@ ap.add_argument("--reduce-vias", action="store_true",
 ap.add_argument("-v", "--verbose", action="store_true", help="explain failed connections")
 ap.add_argument("--max-rip", type=int, default=6, help="tracks a blocked connection may rip up (0: no rip-up)")
 ap.add_argument("--max-rip-nets", type=int, default=2, help="nets whose tracks a rip-up may move")
+ap.add_argument("--through", action="store_true",
+                help="bus mode on a routed board: the bus nets' own routes are taken up first, and the bundles "
+                     "may pass through other nets' unlocked tracks; those are taken out for the autorouter to "
+                     "route again")
+ap.add_argument("--max-push", type=int, default=25,
+                help="--through: tracks/vias of other nets one bus may push aside")
 ap.add_argument("--trim-fanout", type=float, default=0.0,
                 help="bus mode: leave the bundles this far (mm) away from fine-pitch parts, whose fan-out "
                      "the autorouter then does pin by pin (0: bundles run pad to pad)")
@@ -902,7 +908,7 @@ def bundle_order(nets):
     return order
 
 
-def follow(net, a, b_pt, la, lb, width, prev, pitch, reserve=0.0):
+def follow(net, a, b_pt, la, lb, width, prev, pitch, reserve=0.0, soft=False):
     """Route one net of a bus. Next to its neighbour (prev): first inside a corridor along it (the
     bundle stays together), then, if the corridor is blocked, anywhere with the lane only preferred.
     The middle net (no neighbour) first keeps room for the rest of the bundle on both sides."""
@@ -911,16 +917,17 @@ def follow(net, a, b_pt, la, lb, width, prev, pitch, reserve=0.0):
         # a narrow corridor first; a wider one (still well within what reads as running alongside)
         # before giving up the neighbour altogether
         for corridor in (max(1.5, 3 * pitch), 2.4):
-            path = route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch, corridor=corridor)
+            path = route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch, corridor=corridor,
+                         soft=soft)
             if path:
                 return path
         say(f"  {net}: corridor along its neighbour blocked, routing freely")
     elif reserve > 0:
-        path = route(net, a, b_pt, la, lb, width, 0.0, deadline, reserve=reserve)
+        path = route(net, a, b_pt, la, lb, width, 0.0, deadline, reserve=reserve, soft=soft)
         if path:
             return path
         say(f"  {net}: no room for the whole bundle, routing the middle net alone")
-    return route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch)
+    return route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch, soft=soft)
 
 
 def bus_pitch(nets):
@@ -1082,14 +1089,27 @@ def route_buses(bus_data):
     def group(net, ref):
         return next((s_ for s_ in joined.get(net, []) if ref in s_), {ref})
 
+    if ns.through:
+        import buses as bus_tools
     for bus in sorted(bus_data.get("detail", []), key=span_of):
         if time.time() > t_start + ns.time_budget:
             break
+        mark = len(journal)
+        if ns.through:
+            # on a routed board only buses that are not bundled yet are laid again; their nets' own
+            # routes go first (the bundle replaces them)
+            before, _l = bus_tools.parallelism(b, bus)
+            if before >= 0.6:
+                continue
+            for i, it in enumerate(items):
+                if it is not None and it[0] in bus["nets"] and it[4] is not None:
+                    take_out(i)
         if any(bus["to"] in group(n, bus["from"]) for n in bus["nets"]):
             say(f"bus {bus['from']}->{bus['to']}: its parts are already joined by other bundles")
+            rollback(mark)
             continue
         n_items, n_holes = len(items), len(holes)
-        segs_of, laid = {}, []
+        segs_of, laid, pushed = {}, [], 0
         pitch_all = bus_pitch(bus["nets"])
         for net, nb in bundle_order(bus["nets"]):
             e = ends(bus, net)
@@ -1100,12 +1120,25 @@ def route_buses(bus_data):
             w = classes.width(net)
             pitch = w + need(net, nb) if nb else 0.0
             path = follow(net, a_, b_, la_, lb_, w, segs_of.get(nb), pitch,
-                          reserve=math.ceil((len(bus["nets"]) - 1) / 2) * pitch_all)
+                          reserve=math.ceil((len(bus["nets"]) - 1) / 2) * pitch_all, soft=ns.through)
             if not path:
                 say(f"bus {bus['from']}->{bus['to']}: {net} does not fit, bus left to the autorouter")
                 laid = None if not laid else laid + [None]
                 break
+            first = len(items)
             new = insert(net, path, w)
+            for k in range(first, len(items)):   # the bundle itself is never taken out again
+                if items[k] is not None:
+                    items[k] = items[k][:4] + (None,)
+            if ns.through:   # whatever of other nets is in the way goes; the autorouter routes it again
+                for idx in victims_of(new, net):
+                    if items[idx] is not None:
+                        take_out(idx)
+                        pushed += 1
+                if pushed > ns.max_push:
+                    say(f"bus {bus['from']}->{bus['to']}: would push {pushed} tracks of other nets aside, left as it is")
+                    laid = None if not laid else laid + [None]
+                    break
             laid += new
             segs_of[net] = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x),
                              TO(o.GetEnd().y)) for o in new if o.GetClass() == "PCB_TRACK"]
@@ -1136,13 +1169,8 @@ def route_buses(bus_data):
             for o in laid:
                 o.SetLocked(not ns.unlocked)
             report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets'])} nets")
-        else:
-            for o in (laid or []):
-                if o is not None:
-                    b.Delete(o)
-            for i in range(n_items, len(items)):
-                items[i] = None
-            del holes[n_holes:]
+        else:   # the bus goes again; whatever it had taken out comes back
+            rollback(mark)
     return report_lines
 
 

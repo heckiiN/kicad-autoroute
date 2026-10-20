@@ -47,6 +47,8 @@ enabled = true          # buses (runs of nets between two parts, found in the ne
                         # bundles before routing; a routing variant, chosen only when it is as complete
 lock = true             # the autorouter routes around the bundles; if connections stay open at the
                         # end, the finishing pass may still rip them up
+reroute = false         # experimental: lay badly bundled buses again on the best routed board and let
+                        # Freerouting continue from there (variant _rebus)
 fanout_first = false    # experimental: fan fine-pitch parts out first (short Freerouting run) and
                         # lay the bundles to those vias instead of cutting them back
 trim_fanout = 1.5       # bundles stop this far (mm) from fine-pitch parts; their fan-out is routed
