@@ -1288,6 +1288,42 @@ def connect_pieces(zone):
     return made
 
 
+def plane_drop(net, ends, deadline):
+    """Last resort for a net with a pour on an inner layer: each end gets its own short way down to
+    that pour (a via next to it), the way people tie a decoupling capacitor to a supply plane when
+    there is no room to join it on the surface. Kept only if KiCad counts fewer open connections."""
+    planes = [(z, l) for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetname() == net
+              for l in z.GetLayerSet().Seq() if l in layers and l not in (pcbnew.F_Cu, pcbnew.B_Cu)]
+    if not planes:
+        return 0
+    before = open_connections()
+    mark = len(journal)
+    made = 0
+    for pos, lay in ends:
+        for zone, l in planes:
+            target, tl = zone_target(zone, pos, [l])
+            if target is None:
+                continue
+            widths = sorted({classes.width(net), max(ns.min_width, 0.1)}, reverse=True)
+            for w in widths:
+                p = route(net, pos, target, lay, [tl], w, goal_radius=0.3, deadline=deadline)
+                if p:
+                    insert(net, p, w)
+                    made += 1
+                    break
+            else:
+                # crowded around the end (a fine-pitch pin, a via cluster): make room
+                if ns.max_rip > 0 and ripup(net, pos, target, lay, [tl], widths[-1], 0.3, deadline):
+                    made += 1
+                else:
+                    continue
+            break
+    if not made or open_connections() >= before:
+        rollback(mark)
+        return 0
+    return made
+
+
 seen_pairs = set()
 zones_joined = set()
 for u in sorted(report.get("unconnected_items", []), key=span):
@@ -1352,6 +1388,11 @@ for u in sorted(report.get("unconnected_items", []), key=span):
                 path = True
                 done.append(f"{net} ({w} mm, ripped and re-routed {res[0]} tracks of {', '.join(res[1])})")
                 break
+    if not path and kc != "zone":
+        n = plane_drop(net, [(a, la), (c, lc)], t_start + ns.time_budget)
+        if n:
+            path = True
+            done.append(f"{net} (both ends tied to its inner-layer pour, {n} ways down)")
     if not path:
         failed.append(net)
 b.Save(ns.board)
