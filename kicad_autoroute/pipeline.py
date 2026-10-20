@@ -20,6 +20,7 @@ Results: <work>/result/<name>.kicad_pcb (+ .kicad_pro/.kicad_dru), report.json, 
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -352,6 +353,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
             # long buses need a larger search budget than single connections; a coarser grid keeps it fast
             log(kpy(HERE / "lastmile.py", bus_pre, buses_json, "--buses", "--min-width", min_track_width(pro, dru),
                     "--max-cells", 200000, "--max-expansions", 1500000, "--time-budget", 1500,
+                    "--trim-fanout", cfg.get("buses", {}).get("trim_fanout", 1.5),
                     *([] if cfg.get("buses", {}).get("lock", True) else ["--unlocked"]),
                     timeout=1800, fatal=False))
             dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
@@ -373,7 +375,8 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     # this even leaves fewer connections open (coldfire: 18 instead of 23 open, 291 instead of 335 vias)
     if fr.get("via_costs", 120) and not any("via_costs" in a for a in extra):
         extra.append(f"--router.scoring.via_costs={fr.get('via_costs', 120)}")
-    min_w_um = int(round(min_track_width(pro, dru) * 1000))
+    # rounded up: a neck of 198 um on a 0.19812 mm (7.8 mil) board would fail DRC and be re-routed
+    min_w_um = math.ceil(min_track_width(pro, dru) * 1000 - 1e-6)
     if fr.get("min_trace_width", True) and not any("min_trace_width" in a for a in extra):
         extra.append(f"--router.min_trace_width_um={min_w_um}")
     seeds = fr.get("seeds", 4)

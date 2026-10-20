@@ -45,6 +45,8 @@ enabled = true          # buses (runs of nets between two parts, found in the ne
                         # bundles before routing; a routing variant, chosen only when it is as complete
 lock = true             # the autorouter routes around the bundles; if connections stay open at the
                         # end, the finishing pass may still rip them up
+trim_fanout = 1.5       # bundles stop this far (mm) from fine-pitch parts; their fan-out is routed
+                        # pin by pin, so the bundle vias do not wall the part in (0: pad to pad)
 
 [freerouting]
 seeds = 4               # runs with different item orders; the best one wins

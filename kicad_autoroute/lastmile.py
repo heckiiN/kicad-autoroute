@@ -44,6 +44,9 @@ ap.add_argument("--reduce-vias", action="store_true",
 ap.add_argument("-v", "--verbose", action="store_true", help="explain failed connections")
 ap.add_argument("--max-rip", type=int, default=6, help="tracks a blocked connection may rip up (0: no rip-up)")
 ap.add_argument("--max-rip-nets", type=int, default=2, help="nets whose tracks a rip-up may move")
+ap.add_argument("--trim-fanout", type=float, default=0.0,
+                help="bus mode: leave the bundles this far (mm) away from fine-pitch parts, whose fan-out "
+                     "the autorouter then does pin by pin (0: bundles run pad to pad)")
 ap.add_argument("--rip-depth", type=int, default=2,
                 help="a net moved by a rip-up may itself move others, this many levels deep")
 ap.add_argument("--rip-cost", type=float, default=1.0, help="cost of crossing a rippable track, mm of trace per grid cell")
@@ -922,6 +925,78 @@ def bus_pitch(nets):
     return max(classes.width(n) for n in nets) + max(need(x, y) for x, y in zip(nets, nets[1:]))
 
 
+def _clip_outside(seg, box):
+    """Parts of a segment (x1, y1, x2, y2) outside an axis-parallel box (Liang-Barsky)."""
+    x1, y1, x2, y2 = seg
+    bx0, by0, bx1, by1 = box
+    dx, dy = x2 - x1, y2 - y1
+    t0, t1 = 0.0, 1.0
+    for p_, q_ in ((-dx, x1 - bx0), (dx, bx1 - x1), (-dy, y1 - by0), (dy, by1 - y1)):
+        if abs(p_) < 1e-12:
+            if q_ < 0:
+                return [seg]          # parallel to an edge and outside: no overlap
+            continue
+        r = q_ / p_
+        if p_ < 0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+    if t0 >= t1:
+        return [seg]
+    out = []
+    if t0 > 1e-9:
+        out.append((x1, y1, x1 + t0 * dx, y1 + t0 * dy))
+    if t1 < 1 - 1e-9:
+        out.append((x1 + t1 * dx, y1 + t1 * dy, x2, y2))
+    return out
+
+
+def fanout_box(ref, nets, margin):
+    """The region around a fine-pitch part where its pins fan out: the bounding box of its pads,
+    grown by margin; None if the bus pins of the part are not fine-pitch (< 0.8 mm apart)."""
+    f = b.FindFootprintByReference(ref)
+    if f is None:
+        return None
+    pads = list(f.Pads())
+    bus_pads = [p for p in pads if p.GetNetname() in nets]
+    pts = [(TO(p.GetPosition().x), TO(p.GetPosition().y)) for p in bus_pads]
+    pitch = min((math.hypot(a[0] - c[0], a[1] - c[1]) for i, a in enumerate(pts) for c in pts[i + 1:]), default=9.0)
+    if pitch >= 0.8 or any(p.GetAttribute() != pcbnew.PAD_ATTRIB_SMD for p in bus_pads):
+        return None
+    boxes = [p.GetBoundingBox() for p in pads]
+    return (min(TO(x.GetLeft()) for x in boxes) - margin, min(TO(x.GetTop()) for x in boxes) - margin,
+            max(TO(x.GetRight()) for x in boxes) + margin, max(TO(x.GetBottom()) for x in boxes) + margin)
+
+
+def trim_fanout(objs, boxes):
+    """Takes the parts of a laid bundle inside the fan-out boxes out again (vias inside go, tracks
+    are cut at the box edge); returns the board items that are left."""
+    kept = []
+    for o in objs:
+        if o.GetClass() == "PCB_VIA":
+            x, y = TO(o.GetPosition().x), TO(o.GetPosition().y)
+            if any(bx0 <= x <= bx1 and by0 <= y <= by1 for bx0, by0, bx1, by1 in boxes):
+                b.Delete(o)
+            else:
+                kept.append(o)
+            continue
+        pieces = [(TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y))]
+        for box in boxes:
+            pieces = [q for piece in pieces for q in _clip_outside(piece, box)]
+        pieces = [q for q in pieces if math.hypot(q[2] - q[0], q[3] - q[1]) > 0.05]
+        if not pieces:
+            b.Delete(o)
+            continue
+        for k, (x1, y1, x2, y2) in enumerate(pieces):
+            t = o if k == 0 else pcbnew.PCB_TRACK(b)
+            if k:
+                t.SetWidth(o.GetWidth()); t.SetLayer(o.GetLayer()); t.SetNet(o.GetNet())
+                b.Add(t)
+            t.SetStart(pcbnew.VECTOR2I(FROM(x1), FROM(y1))); t.SetEnd(pcbnew.VECTOR2I(FROM(x2), FROM(y2)))
+            kept.append(t)
+    return kept
+
+
 def route_buses(bus_data):
     """Lay every bus as a bundle: its nets in pin order, each one drawn to the lane right next to
     the previous one. The bundles are locked, so the autorouter routes around them."""
@@ -983,6 +1058,22 @@ def route_buses(bus_data):
                 sets = joined.setdefault(n, [])
                 ga, gb = group(n, bus["from"]), group(n, bus["to"])
                 sets[:] = [s_ for s_ in sets if s_ is not ga and s_ is not gb] + [ga | gb]
+            boxes = [x for x in (fanout_box(ref, set(bus["nets"]), ns.trim_fanout) for ref in (bus["from"], bus["to"]))
+                     if x] if ns.trim_fanout > 0 else []
+            if boxes:
+                # the trunk stays, the fan-out at fine-pitch parts is left to the autorouter
+                laid = trim_fanout(laid, boxes)
+                for i in range(n_items, len(items)):
+                    items[i] = None
+                del holes[n_holes:]
+                for o in laid:
+                    if o.GetClass() == "PCB_VIA":
+                        x, y = TO(o.GetPosition().x), TO(o.GetPosition().y)
+                        holes.append((x, y, TO(o.GetDrillValue()) / 2))
+                        items.append((o.GetNetname(), layers, "disc", (x, y, TO(o.GetWidth(pcbnew.F_Cu)) / 2), None))
+                    else:
+                        items.append((o.GetNetname(), [o.GetLayer()], "seg", (TO(o.GetStart().x), TO(o.GetStart().y),
+                                      TO(o.GetEnd().x), TO(o.GetEnd().y), TO(o.GetWidth()) / 2), None))
             for o in laid:
                 o.SetLocked(not ns.unlocked)
             report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets'])} nets")

@@ -14,6 +14,7 @@ KiCad's exporter leaves rules out that the router needs to know:
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import sys
@@ -66,7 +67,8 @@ def fix_vias(tree, rules: ViaRules) -> list[str]:
 
 def fix_minimums(tree, board: str) -> list[str]:
     """Net-class widths and clearances below the board minimums are raised to them."""
-    min_w, min_c = (round(v * 1000) for v in board_minimums(board))
+    # rounded up to whole um: below the minimum by a fraction still fails KiCad's DRC
+    min_w, min_c = (math.ceil(v * 1000 - 1e-6) for v in board_minimums(board))
     notes = []
     rules = [("structure", dsn.child(dsn.child(tree, "structure"), "rule"))]
     rules += [(dsn.atoms(c)[1], dsn.child(c, "rule")) for c in dsn.children(dsn.child(tree, "network"), "class")]
