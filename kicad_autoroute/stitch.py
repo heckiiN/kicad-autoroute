@@ -148,9 +148,9 @@ def link_ok(a, c, tw, layer, skip_pads):
 # Vias are a cost people avoid: a pad first tries a short straight track to copper of the net
 # that already reaches the pour (a through-hole pad, a via, a pad linked before), the way
 # neighbouring ground pins share one via.
-# next to a plane neighbours within a few millimetres share (a decoupling capacitor beside its IC
-# pin, ground pins of one part): people keep the vias into the plane few
-share_reach = ns.share_reach if b.GetCopperLayerCount() <= 2 else min(ns.share_reach, 5.0)
+# next to a plane, pads further apart share too (a decoupling capacitor beside its IC pin, ground
+# pins of one part; 8 mm by default): people keep the vias into the plane few
+share_reach = ns.share_reach if b.GetCopperLayerCount() <= 2 or ns.share_reach <= 0 else ns.share_reach + 2.0
 # 2-layer boards: a pad on a side that has a pour of the net is joined by that pour, no via needed
 poured = {l for z in b.Zones() if z.GetNetname() == ns.net and not z.GetIsRuleArea()
           for l in z.GetLayerSet().Seq()} if b.GetCopperLayerCount() <= 2 else set()
