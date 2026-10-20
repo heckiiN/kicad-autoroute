@@ -9,18 +9,19 @@ with no lower bound. KiCad's Specctra export does not carry the board's minimum 
 (it lives in KiCad's own rules), so necked traces regularly fail KiCad DRC.
 
 The new setting (micrometers, 0/absent = no limit) sets the board rules' minimum allowed
-trace half width, and Pin.getTraceNeckdownHalfwidth never returns less than that.
+trace half width; Pin.getTraceNeckdownHalfwidth never returns less than that, and the fanout's
+micro-neckdown (3/4, 3/5 and 1/2 of the trace width) skips widths below it.
 ---
- docs/settings.md                              |  4 +++
- .../autoroute/pipeline/BatchAutorouter.java   | 12 +++++++
- .../freerouting/board/model/items/Pin.java    |  2 ++
- .../freerouting/settings/RouterSettings.java  | 14 ++++++++
- .../settings/MinTraceWidthSettingsTest.java   | 35 +++++++++++++++++++
- 5 files changed, 67 insertions(+)
+ docs/settings.md                                           |  4 ++++
+ .../autoroute/path/FoundConnectionInserter.java            |  6 +++++-
+ .../freerouting/autoroute/pipeline/BatchAutorouter.java    | 12 ++++++++++++
+ src/main/java/app/freerouting/board/model/items/Pin.java   |  2 ++
+ src/main/java/app/freerouting/settings/RouterSettings.java | 14 ++++++++++++++
+ 5 files changed, 37 insertions(+), 1 deletion(-)
  create mode 100644 src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java
 
 diff --git a/docs/settings.md b/docs/settings.md
-index 9552f24..e147247 100644
+index 9552f24a..e1472474 100644
 --- a/docs/settings.md
 +++ b/docs/settings.md
 @@ -154,6 +154,10 @@ The primary way to configure Freerouting is through a JSON settings file. This f
@@ -34,8 +35,26 @@ index 9552f24..e147247 100644
  - **`layers`**: An array of layer-specific settings (transient, typically set via CLI or loaded from board files). Each element contains:
      - **`routable`**: Boolean indicating if the layer is active/routable by the autorouter.
      - **`preferred_direction_horizontal`**: Boolean indicating if the preferred direction on this layer is horizontal.
+diff --git a/src/main/java/app/freerouting/autoroute/path/FoundConnectionInserter.java b/src/main/java/app/freerouting/autoroute/path/FoundConnectionInserter.java
+index 843ada3a..2057173a 100644
+--- a/src/main/java/app/freerouting/autoroute/path/FoundConnectionInserter.java
++++ b/src/main/java/app/freerouting/autoroute/path/FoundConnectionInserter.java
+@@ -501,8 +501,12 @@ public final class FoundConnectionInserter {
+     candidateHalfWidths.add(Math.max(1, (baseHalfWidth * 3) / 5));
+     candidateHalfWidths.add(Math.max(1, baseHalfWidth / 2));
+ 
++    int minAllowedHalfWidth = board.rules.getMinAllowedTraceHalfWidth();
+     for (int candidateHalfWidth : candidateHalfWidths) {
+-      if (candidateHalfWidth <= 0 || candidateHalfWidth >= baseHalfWidth) {
++      // never below the narrowest trace the design rules allow (0: no limit)
++      if (candidateHalfWidth <= 0
++          || candidateHalfWidth < minAllowedHalfWidth
++          || candidateHalfWidth >= baseHalfWidth) {
+         continue;
+       }
+       Point candidateOkPoint =
 diff --git a/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java b/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
-index 798388a..17643d6 100644
+index 798388a0..17643d65 100644
 --- a/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
 +++ b/src/main/java/app/freerouting/autoroute/pipeline/BatchAutorouter.java
 @@ -12,6 +12,7 @@ import app.freerouting.board.model.items.Item;
@@ -65,7 +84,7 @@ index 798388a..17643d6 100644
      this.startNecked =
          settings.autorouter == null
 diff --git a/src/main/java/app/freerouting/board/model/items/Pin.java b/src/main/java/app/freerouting/board/model/items/Pin.java
-index bced3a7..40a8f1b 100644
+index bced3a73..40a8f1b3 100644
 --- a/src/main/java/app/freerouting/board/model/items/Pin.java
 +++ b/src/main/java/app/freerouting/board/model/items/Pin.java
 @@ -584,6 +584,8 @@ public class Pin extends DrillItem implements Serializable {
@@ -78,7 +97,7 @@ index bced3a7..40a8f1b 100644
    }
  
 diff --git a/src/main/java/app/freerouting/settings/RouterSettings.java b/src/main/java/app/freerouting/settings/RouterSettings.java
-index 4717482..2361cee 100644
+index 4717482a..2361cee6 100644
 --- a/src/main/java/app/freerouting/settings/RouterSettings.java
 +++ b/src/main/java/app/freerouting/settings/RouterSettings.java
 @@ -65,6 +65,14 @@ public class RouterSettings implements Serializable, Cloneable {
@@ -118,7 +137,7 @@ index 4717482..2361cee 100644
      return neckWidthUm != null && neckWidthUm > 0 ? neckWidthUm : 0;
 diff --git a/src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java b/src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java
 new file mode 100644
-index 0000000..9cd7cf4
+index 00000000..9cd7cf4c
 --- /dev/null
 +++ b/src/test/java/app/freerouting/settings/MinTraceWidthSettingsTest.java
 @@ -0,0 +1,35 @@
@@ -157,6 +176,3 @@ index 0000000..9cd7cf4
 +    assertEquals(200.0, settings.clone().getMinTraceWidthUm(), 1e-9);
 +  }
 +}
--- 
-2.37.0.windows.1
-

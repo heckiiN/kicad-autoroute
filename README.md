@@ -25,7 +25,7 @@ five of KiCad's six demo boards completely, but it does **not** finish every boa
 boards a few connections can stay open and have to be routed by hand.
 
 KiCad's demo boards, default settings, no per-board tuning, run with `benchmark/run_benchmark.py`
-(full output in `docs/benchmark-2026-10-20d.md`, plugin-workflow numbers from `docs/benchmark-2026-10-17.md`); the last row
+(full output in `docs/benchmark-2026-10-20i.md`, plugin-workflow numbers from `docs/benchmark-2026-10-17.md`); the last row
 is a private board, routed in an earlier version with the same settings.
 Cells: unconnected / DRC errors, counted by KiCad's DRC after refilling zones.
 
@@ -35,12 +35,12 @@ Cells: unconnected / DRC errors, counted by KiCad's DRC after refilling zones.
 | sonde xilinx | 2 / 25 | 0 / 0 | 2 / 2 | **0 / 0** | 4 min |
 | pic_programmer | 2 / 63 | 0 / 0 | 2 / 2 | **0 / 0** | 5 min |
 | interf_u | 2 / 25 | 0 / 2 | 13 / 5 | **0 / 0** | 11 min |
-| multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **0 / 0** | 12 min |
-| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **1 / 0**² | 69 min |
+| multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **0 / 0** | 6 min |
+| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **3 / 0**² | 62 min |
 | private board (HV rules) | 4 / 491 | 0 / 0 | no result in 1 h | **83 / 2**³ | 2.6 h |
 
 ¹ Tracks removed, KiCad's Specctra export, Freerouting 2.4.1 with up to 100 passes, session imported back.
-² Results vary between runs (Freerouting's passes depend on timing); recent runs left 1–3 open.
+² Results vary between runs (Freerouting's passes depend on timing); recent runs left 1–4 open.
 ³ An earlier version; the remaining errors were "starved thermal" reliefs on the ground pour.
 
 ### Does it look hand-made?
@@ -49,8 +49,9 @@ Complete is not the same as tidy. `benchmark/scorecard.py` compares every routed
 hand-routed original: complete (0 open, 0 errors), at most 1.1 × the human's vias + 2, buses (runs of
 neighbouring pins between two parts) at least as bundled as the human laid them (share of bus length
 running alongside its neighbour, human − 0.05), and on 2-layer boards as much copper on the main side
-(human − 0.10). Five of six demo boards pass all four; kit-dev-coldfire does not yet (1 open, 281
-instead of at most 280 vias, its buses 0.26 bundled against the human's 0.80).
+(human − 0.10). Five of six demo boards pass all four. kit-dev-coldfire does not yet: its vias are
+within the human's range now (253–284 against 253), but 2–4 connections stay open and its buses are
+0.37–0.48 bundled against the human's 0.80.
 
 Measured on Windows 10, KiCad 10.0, 4 seeds × 20 min, 16 cores. `tinytapeout-demo` is left out:
 KiCad's Python API does not load it within 15 minutes on this machine.
@@ -133,9 +134,10 @@ python benchmark/compare_views.py benchmark/results/<date>
 
 ## Freerouting changes
 
-`freerouting-patches/0001-min-trace-width.patch` adds `router.min_trace_width_um`: automatic
-neckdown never goes below the board's minimum track width (KiCad's export does not carry it, so
-necked traces failed KiCad DRC). It is meant to go upstream.
+`freerouting-patches/0001-min-trace-width.patch` adds `router.min_trace_width_um`: neither the
+automatic neckdown at pins nor the fanout's micro-neckdown (3/4, 3/5, 1/2 of the trace width) goes
+below the board's minimum track width (KiCad's export does not carry it, so necked traces failed
+KiCad DRC and had to be taken up and routed again). It is meant to go upstream.
 
 `experimental-congestion-history.patch` is a negotiated-congestion (PathFinder-style) history cost
 for Freerouting's maze search. It gave **no measurable gain** on the DAC2020 and KiCad demo boards
