@@ -908,10 +908,12 @@ def follow(net, a, b_pt, la, lb, width, prev, pitch, reserve=0.0):
     The middle net (no neighbour) first keeps room for the rest of the bundle on both sides."""
     deadline = t_start + ns.time_budget
     if prev:
-        path = route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch,
-                     corridor=max(1.5, 3 * pitch))
-        if path:
-            return path
+        # a narrow corridor first; a wider one (still well within what reads as running alongside)
+        # before giving up the neighbour altogether
+        for corridor in (max(1.5, 3 * pitch), 2.4):
+            path = route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch, corridor=corridor)
+            if path:
+                return path
         say(f"  {net}: corridor along its neighbour blocked, routing freely")
     elif reserve > 0:
         path = route(net, a, b_pt, la, lb, width, 0.0, deadline, reserve=reserve)
@@ -997,22 +999,76 @@ def trim_fanout(objs, boxes):
     return kept
 
 
+def join_extra_pads(net, trunk, pads):
+    """Joins each pad to the nearest point of the laid trunk tracks; returns the new board items
+    (pads that find no way are left to the autorouter)."""
+    made = []
+    w = classes.width(net)
+    for p in pads:
+        if not trunk:
+            break
+        px, py = TO(p.GetPosition().x), TO(p.GetPosition().y)
+        best = None
+        for t in trunk:
+            sx, sy, ex, ey = TO(t.GetStart().x), TO(t.GetStart().y), TO(t.GetEnd().x), TO(t.GetEnd().y)
+            dx, dy = ex - sx, ey - sy
+            L2 = dx * dx + dy * dy
+            u = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / L2))
+            q = (sx + u * dx, sy + u * dy)
+            d = math.hypot(q[0] - px, q[1] - py)
+            if best is None or d < best[0]:
+                best = (d, q, t.GetLayer())
+        if best[0] > 15.0:   # far away: a part of its own, not a pull-up beside the bus
+            continue
+        path = route(net, (px, py), best[1], [l for l in layers if p.IsOnLayer(l)], [best[2]], w, 0.0,
+                     t_start + ns.time_budget)
+        if not path:
+            say(f"  {net}: extra pad at ({px:.1f}, {py:.1f}) left to the autorouter")
+            continue
+        first = len(items)
+        new = insert(net, path, w)
+        for k in range(first, len(items)):   # locked with the bundle
+            if items[k] is not None:
+                items[k] = items[k][:4] + (None,)
+        made += new
+    return made
+
+
 def route_buses(bus_data):
     """Lay every bus as a bundle: its nets in pin order, each one drawn to the lane right next to
     the previous one. The bundles are locked, so the autorouter routes around them."""
-    pad_of = {}
+    pad_of, pads_of = {}, {}
     for f in b.GetFootprints():
         for p in f.Pads():
             if p.GetNetname():
                 pad_of[(f.GetReference(), p.GetNetname())] = p
+                pads_of.setdefault(p.GetNetname(), []).append((f.GetReference(), p))
+    # parts a bus of the net ends at; any other pad of a bus net (a pull-up, a test point) is joined
+    # to the laid trunk, so the autorouter is not tempted to route the net a second time around it
+    bus_ends = {}
+    for bus_ in bus_data.get("detail", []):
+        for n in bus_["nets"]:
+            bus_ends.setdefault(n, set()).update((bus_["from"], bus_["to"]))
     report_lines = []
+
+    def landing(net, pad):
+        """Where the bus net starts at this pad: the pad itself, or the via its fan-out (laid before,
+        locked) already leads to; then the bundle runs to that via on any layer."""
+        x, y = TO(pad.GetPosition().x), TO(pad.GetPosition().y)
+        if pad.GetAttribute() == pcbnew.PAD_ATTRIB_SMD:
+            vias = [it[3] for it in items if it is not None and it[0] == net and it[2] == "disc" and it[4] is None
+                    and math.hypot(it[3][0] - x, it[3][1] - y) <= 3.0]
+            if vias:
+                vx, vy, _r = min(vias, key=lambda v: math.hypot(v[0] - x, v[1] - y))
+                return (vx, vy), list(layers)
+        return (x, y), [l for l in layers if pad.IsOnLayer(l)]
 
     def ends(bus, net):
         pa, pb = pad_of.get((bus["from"], net)), pad_of.get((bus["to"], net))
         if pa is None or pb is None:
             return None
-        return ((TO(pa.GetPosition().x), TO(pa.GetPosition().y)), [l for l in layers if pa.IsOnLayer(l)],
-                (TO(pb.GetPosition().x), TO(pb.GetPosition().y)), [l for l in layers if pb.IsOnLayer(l)])
+        (a, la), (c, lc) = landing(net, pa), landing(net, pb)
+        return a, la, c, lc
 
     def span_of(bus):
         e = [ends(bus, n) for n in bus["nets"]]
@@ -1074,6 +1130,9 @@ def route_buses(bus_data):
                     else:
                         items.append((o.GetNetname(), [o.GetLayer()], "seg", (TO(o.GetStart().x), TO(o.GetStart().y),
                                       TO(o.GetEnd().x), TO(o.GetEnd().y), TO(o.GetWidth()) / 2), None))
+            for net_ in bus["nets"]:
+                laid += join_extra_pads(net_, [o for o in laid if o.GetClass() == "PCB_TRACK" and o.GetNetname() == net_],
+                                        [p for ref, p in pads_of.get(net_, []) if ref not in bus_ends.get(net_, ())])
             for o in laid:
                 o.SetLocked(not ns.unlocked)
             report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets'])} nets")

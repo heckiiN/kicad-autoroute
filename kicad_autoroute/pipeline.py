@@ -123,7 +123,8 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
            buses_json: Path | None = None, unlock_against: Path | None = None) -> list[str]:
     """Close what the router left: replace necked tracks, last-mile route open connections, drop
     dangling leftovers and too-close vias, repeat; then clean up the silkscreen. unlock_against: the
-    board before bundles were laid; if connections stay open, the bundles may be ripped up after all."""
+    user's board; if connections stay open, what the pipeline locked itself (bus bundles, stitching
+    links) may be ripped up after all, the user's own locked routes stay."""
     notes = []
     if min_w:
         notes.append(steps("drop_narrow", pcb, min_w))
@@ -160,7 +161,8 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
         if one_round():
             break
     if unlock_against and drc(pcb)["unconnected"]:
-        # completeness before tidiness: bundles that block the last connections may be ripped up
+        # completeness before tidiness: bundles and stitching links that block the last connections
+        # may be ripped up
         notes.append(steps("unlock_new", pcb, unlock_against))
         for _ in range(2):
             if one_round():
@@ -243,10 +245,10 @@ def pick_candidates(scored: list[dict], n: int) -> list[dict]:
     # would spend its whole budget on it); a few more are fine, styles often finish cleaner
     reach = ranked[0]["unconnected"] + 6 if ranked else 0
     for r in ranked:
-        if r["unconnected"] > reach:
-            continue
         stem = Path(r["ses"]).stem
         variant = next((t for t in ("_1L", "_main", "_bus") if stem.endswith(t)), "")
+        if r["unconnected"] > reach:
+            continue
         if variant not in variants:
             variants.add(variant)
             picked.append(r)
@@ -326,7 +328,13 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
         log(kpy(HERE / "escape.py", pre, "--min-class-width", esc.get("min_class_width", 0.5)))
     st = cfg.get("stitch", {})
     if st.get("enabled", False):
-        args = [pre, "--net", st.get("net", "GND")]
+        # the plane net, and on multilayer boards every other net with an inner-layer pour (supply
+        # planes): their pads get their way into the plane before routing closes it off, as people
+        # place the supply vias of a fine-pitch part first
+        stitch_nets = [st.get("net", "GND")]
+        if st.get("supply_planes", True):
+            stitch_nets += [n for n in json.loads(steps("plane_nets", pre).splitlines()[-1]) if n not in stitch_nets]
+        args = [pre] + [a for net in stitch_nets for a in ("--net", net)]
         if st.get("skip_refs"):
             args += ["--skip-refs", ",".join(st["skip_refs"])]
         log(kpy(HERE / "stitch.py", *args))
@@ -342,24 +350,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     dsn.parent.mkdir(parents=True, exist_ok=True)
     log(steps("export", pre, dsn))
 
-    # buses (runs of nets between two parts, found in the netlist) are laid as parallel bundles on a
-    # copy of the board before Freerouting routes the rest; a routing variant like the layer styles
-    bus_pre, dsn_bus, buses_json = None, None, work / "route" / "buses.json"
-    if cfg.get("buses", {}).get("enabled", True):
-        found = json.loads(kpy(HERE / "buses.py", pre, "--json").splitlines()[-1])
-        if found["buses"]:
-            buses_json.write_text(json.dumps(found), encoding="utf-8")
-            bus_pre = copy_project(pre, work / "board_bus", name)
-            # long buses need a larger search budget than single connections; a coarser grid keeps it fast
-            log(kpy(HERE / "lastmile.py", bus_pre, buses_json, "--buses", "--min-width", min_track_width(pro, dru),
-                    "--max-cells", 200000, "--max-expansions", 1500000, "--time-budget", 1500,
-                    "--trim-fanout", cfg.get("buses", {}).get("trim_fanout", 1.5),
-                    *([] if cfg.get("buses", {}).get("lock", True) else ["--unlocked"]),
-                    timeout=1800, fatal=False))
-            dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
-            log(steps("export", bus_pre, dsn_bus))
-
-    # 7: route
+    # Freerouting settings (the fan-out run for the buses below uses them too)
     fr = cfg.get("freerouting", {})
     extra = list(fr.get("args", []))
     edge_um = edge_clearance_um(pro)
@@ -379,6 +370,35 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     min_w_um = math.ceil(min_track_width(pro, dru) * 1000 - 1e-6)
     if fr.get("min_trace_width", True) and not any("min_trace_width" in a for a in extra):
         extra.append(f"--router.min_trace_width_um={min_w_um}")
+
+    # buses (runs of nets between two parts, found in the netlist) are laid as parallel bundles on a
+    # copy of the board before Freerouting routes the rest; a routing variant like the layer styles
+    bus_pre, dsn_bus, buses_json = None, None, work / "route" / "buses.json"
+    if cfg.get("buses", {}).get("enabled", True):
+        found = json.loads(kpy(HERE / "buses.py", pre, "--json").splitlines()[-1])
+        if found["buses"]:
+            buses_json.write_text(json.dumps(found), encoding="utf-8")
+            bus_pre = copy_project(pre, work / "board_bus", name)
+            bus_cfg = cfg.get("buses", {})
+            if bus_cfg.get("fanout_first", False):
+                # people fan a fine-pitch part out first and run the bus to its vias: a short
+                # Freerouting run (its fan-out comes first), whose pin-to-via stubs of the bus nets are
+                # kept, locked; the bundles then end at those vias instead of walling the part in
+                fan = router.run_once(dsn, "fanout", extra, work / "fanout", fr.get("fanout_timeout", "00:04:00"), 1)
+                if fan.ses and Path(fan.ses).exists():
+                    fan_board = copy_project(pre, work / "fanout_board", name)
+                    steps("import", fan_board, Path(fan.ses).resolve(), fan_board)
+                    log(steps("keep_fanout", bus_pre, fan_board, buses_json))
+            # long buses need a larger search budget than single connections; a coarser grid keeps it fast
+            log(kpy(HERE / "lastmile.py", bus_pre, buses_json, "--buses", "--min-width", min_track_width(pro, dru),
+                    "--max-cells", 200000, "--max-expansions", 1500000, "--time-budget", 1500,
+                    "--trim-fanout", bus_cfg.get("trim_fanout", 0.0 if bus_cfg.get("fanout_first", False) else 1.5),
+                    *([] if bus_cfg.get("lock", True) else ["--unlocked"]),
+                    timeout=1800, fatal=False))
+            dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
+            log(steps("export", bus_pre, dsn_bus))
+
+    # 7: route
     seeds = fr.get("seeds", 4)
     # 2-layer boards get routing variants next to the plain one: the main side preferred (most copper
     # on one side, the other for crossings) and single-sided (the finishing pass adds jumpers). Every
@@ -455,7 +475,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     for cand in pick_candidates(scored, finish_cfg.get("candidates", 2)):
         pcb = Path(cand["board"])
         notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False),
-                       buses_json=buses_json, unlock_against=pre if Path(cand["ses"]).stem.endswith("_bus") else None)
+                       buses_json=buses_json, unlock_against=src)
         r = drc(pcb)
         r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
         r["off_share"] = off_share(r, main_layer)

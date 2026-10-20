@@ -2,6 +2,8 @@
 
   <kicad-python> kicad_steps.py strip  board.kicad_pcb [--keep-locked] [--zones]
   <kicad-python> kicad_steps.py unlock_new board.kicad_pcb reference.kicad_pcb
+  <kicad-python> kicad_steps.py plane_nets board.kicad_pcb
+  <kicad-python> kicad_steps.py keep_fanout board.kicad_pcb routed_copy.kicad_pcb buses.json
   <kicad-python> kicad_steps.py apply  board.kicad_pcb placement.json
   <kicad-python> kicad_steps.py zones  board.kicad_pcb '[{"net": "GND", "layers": ["In1.Cu"]}]' [--inset 0.3]
   <kicad-python> kicad_steps.py export board.kicad_pcb out.dsn [--raw]
@@ -46,6 +48,71 @@ def strip(path, keep_locked=False, zones=False):
         gone += 1
     b.Save(path)
     print(f"strip: removed {gone} tracks/vias")
+
+
+def keep_fanout(path, fanout_board, buses_json, reach=3.0):
+    """Copies the autorouter's fan-out of the bus nets (a short way from a fine-pitch pin to a via)
+    from a routed copy onto the board, locked: buses are then laid to those vias, the way people
+    fan a fine-pitch part out first and run the bus to its vias."""
+    nets = {n for bus in json.load(open(buses_json, encoding="utf-8")).get("detail", []) for n in bus["nets"]}
+    src = pcbnew.LoadBoard(fanout_board)
+    dst = pcbnew.LoadBoard(path)
+    fine = {}
+    for f in src.GetFootprints():
+        for p in f.Pads():
+            if p.GetNetname() in nets and p.GetAttribute() == pcbnew.PAD_ATTRIB_SMD and min(TO(p.GetSize().x), TO(p.GetSize().y)) < 0.45:
+                fine.setdefault(p.GetNetname(), []).append(p)
+    tracks = {}
+    for t in src.GetTracks():
+        if t.GetNetname() in fine and t.GetClass() == "PCB_TRACK":
+            tracks.setdefault(t.GetNetname(), []).append(t)
+    kept = 0
+    for v in src.GetTracks():
+        net = v.GetNetname()
+        if v.GetClass() != "PCB_VIA" or net not in fine:
+            continue
+        # walk the net's tracks from the via until a fine-pitch pin of the net, at most `reach` mm
+        frontier, seen, total = [(v.GetPosition(), [])], set(), 0
+        found = None
+        while frontier and found is None:
+            pt, chain = frontier.pop()
+            for t in tracks.get(net, []):
+                if id(t) in seen:
+                    continue
+                for a, z in ((t.GetStart(), t.GetEnd()), (t.GetEnd(), t.GetStart())):
+                    if (a - pt).EuclideanNorm() < FROM(0.005):
+                        length = sum(TO(c.GetLength()) for c in chain) + TO(t.GetLength())
+                        if length > reach:
+                            continue
+                        seen.add(id(t))
+                        pad = next((p for p in fine[net] if p.HitTest(z)), None)
+                        if pad is not None:
+                            found = chain + [t]
+                        else:
+                            frontier.append((z, chain + [t]))
+        if not found:
+            continue
+        nv = pcbnew.PCB_VIA(dst)
+        nv.SetPosition(v.GetPosition()); nv.SetWidth(v.GetWidth(pcbnew.F_Cu)); nv.SetDrill(v.GetDrillValue())
+        nv.SetNet(dst.FindNet(net)); nv.SetLocked(True)
+        dst.Add(nv)
+        for t in found:
+            nt = pcbnew.PCB_TRACK(dst)
+            nt.SetStart(t.GetStart()); nt.SetEnd(t.GetEnd()); nt.SetWidth(t.GetWidth()); nt.SetLayer(t.GetLayer())
+            nt.SetNet(dst.FindNet(net)); nt.SetLocked(True)
+            dst.Add(nt)
+        kept += 1
+    dst.Save(path)
+    print(f"keep_fanout: {kept} fan-out vias of bus nets kept")
+
+
+def plane_nets(path):
+    """Nets with a pour on an inner layer (supply planes of a multilayer board), as JSON."""
+    b = pcbnew.LoadBoard(path)
+    inner = {l for l in b.GetEnabledLayers().CuStack() if l not in (pcbnew.F_Cu, pcbnew.B_Cu)}
+    nets = sorted({z.GetNetname() for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetname()
+                   and any(l in inner for l in z.GetLayerSet().Seq())})
+    print(json.dumps(nets))
 
 
 def unlock_new(path, reference):
@@ -292,6 +359,10 @@ if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "strip":
         strip(args[0], "--keep-locked" in args, "--zones" in args)
+    elif cmd == "keep_fanout":
+        keep_fanout(args[0], args[1], args[2])
+    elif cmd == "plane_nets":
+        plane_nets(args[0])
     elif cmd == "unlock_new":
         unlock_new(args[0], args[1])
     elif cmd == "apply":

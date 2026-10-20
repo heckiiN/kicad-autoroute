@@ -32,6 +32,8 @@ min_class_width = 0.5   # only nets whose class width is at least this (mm)
 [stitch]
 enabled = "auto"        # vias from SMD pads of the plane net into its pour; auto = when the net exists
 net = "GND"             # on 2-layer boards a pad links to nearby ground copper first and shares vias
+supply_planes = true    # multilayer boards: nets with an inner-layer pour get their vias/links too,
+                        # all in one pass, capacitors first, IC pins last (a short knee out of the row)
 # skip_refs = ["U4"]    # parts whose footprint already has thermal vias
 
 [zones]
@@ -45,6 +47,8 @@ enabled = true          # buses (runs of nets between two parts, found in the ne
                         # bundles before routing; a routing variant, chosen only when it is as complete
 lock = true             # the autorouter routes around the bundles; if connections stay open at the
                         # end, the finishing pass may still rip them up
+fanout_first = false    # experimental: fan fine-pitch parts out first (short Freerouting run) and
+                        # lay the bundles to those vias instead of cutting them back
 trim_fanout = 1.5       # bundles stop this far (mm) from fine-pitch parts; their fan-out is routed
                         # pin by pin, so the bundle vias do not wall the part in (0: pad to pad)
 
