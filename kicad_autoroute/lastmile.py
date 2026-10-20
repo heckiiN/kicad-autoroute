@@ -44,6 +44,8 @@ ap.add_argument("--reduce-vias", action="store_true",
 ap.add_argument("-v", "--verbose", action="store_true", help="explain failed connections")
 ap.add_argument("--max-rip", type=int, default=6, help="tracks a blocked connection may rip up (0: no rip-up)")
 ap.add_argument("--max-rip-nets", type=int, default=2, help="nets whose tracks a rip-up may move")
+ap.add_argument("--rip-depth", type=int, default=2,
+                help="a net moved by a rip-up may itself move others, this many levels deep")
 ap.add_argument("--rip-cost", type=float, default=1.0, help="cost of crossing a rippable track, mm of trace per grid cell")
 ap.add_argument("--buses", action="store_true",
                 help="bus mode: the JSON (from buses.py) lists buses; route each as a parallel bundle and lock it")
@@ -88,8 +90,10 @@ for t in b.GetTracks():
     if t.GetClass() == "PCB_VIA":
         holes.append((TO(t.GetPosition().x), TO(t.GetPosition().y), TO(t.GetDrillValue()) / 2))
 
-# copper shapes as (net, layers, kind, geometry, ref) in mm; ref is the board track for unlocked
-# tracks (these may be ripped up and re-routed), None for everything that stays
+# copper shapes as (net, layers, kind, geometry, ref) in mm; ref is the board item for unlocked
+# tracks and vias (these may be ripped up and re-routed), None for everything that stays. Vias of
+# nets with a pour stay: they may tie the net to the pour.
+poured = {z.GetNetname() for z in b.Zones() if not z.GetIsRuleArea()}
 items = []
 for f in b.GetFootprints():
     for p in f.Pads():
@@ -110,7 +114,8 @@ for d in copper_art:
 for t in b.GetTracks():
     if t.GetClass() == "PCB_VIA":
         r = TO(t.GetWidth(pcbnew.F_Cu)) / 2
-        items.append((t.GetNetname(), layers, "disc", (TO(t.GetPosition().x), TO(t.GetPosition().y), r), None))
+        items.append((t.GetNetname(), layers, "disc", (TO(t.GetPosition().x), TO(t.GetPosition().y), r),
+                      t if not t.IsLocked() and t.GetNetname() not in poured else None))
     else:
         items.append((t.GetNetname(), [t.GetLayer()], "seg",
                       (TO(t.GetStart().x), TO(t.GetStart().y), TO(t.GetEnd().x), TO(t.GetEnd().y), TO(t.GetWidth()) / 2),
@@ -457,6 +462,33 @@ def _sign(v):
     return 0 if abs(v) < 1e-6 else (1 if v > 0 else -1)
 
 
+# every board change of insert() and take_out(), so a rip-up can roll back to a checkpoint
+journal = []
+
+
+def take_out(idx):
+    """Removes an unlocked track or via from the board (kept for a roll-back)."""
+    entry = items[idx]
+    b.Remove(entry[4])
+    items[idx] = None
+    journal.append(("out", entry[4], idx, entry))
+
+
+def rollback(mark):
+    while len(journal) > mark:
+        op = journal.pop()
+        if op[0] == "in":
+            _, obj, idx, via = op
+            b.Delete(obj)
+            items[idx] = None
+            if via:
+                holes.pop()
+        else:
+            _, obj, idx, entry = op
+            b.Add(obj)
+            items[idx] = entry
+
+
 def insert(net_name, path, width):
     """Adds the path as tracks and vias; returns the new board items."""
     net = b.FindNet(net_name)
@@ -480,7 +512,8 @@ def insert(net_name, path, width):
             v.SetWidth(FROM(ns.via[0])); v.SetDrill(FROM(ns.via[1])); v.SetNet(net)
             b.Add(v)
             holes.append((p[0], p[1], ns.via[1] / 2))
-            items.append((net_name, layers, "disc", (p[0], p[1], ns.via[0] / 2), None))
+            items.append((net_name, layers, "disc", (p[0], p[1], ns.via[0] / 2), v if net_name not in poured else None))
+            journal.append(("in", v, len(items) - 1, True))
             added.append(v)
             continue
         if (p[0], p[1]) == (q[0], q[1]):
@@ -491,6 +524,7 @@ def insert(net_name, path, width):
         t.SetWidth(FROM(width)); t.SetLayer(p[2]); t.SetNet(net)
         b.Add(t)
         items.append((net_name, [p[2]], "seg", (p[0], p[1], q[0], q[1], width / 2), t))
+        journal.append(("in", t, len(items) - 1, False))
         added.append(t)
     return added
 
@@ -534,11 +568,16 @@ def victims_of(new_items, net):
         if it is None:
             continue
         inet, ilayers, kind, geo, ref = it
-        if ref is None or inet == net or kind != "seg":
+        if ref is None or inet == net or kind not in ("seg", "disc"):
             continue
         clr = need(net, inet) - 1e-4
         for layer, g_, r in shapes:
-            if layer is None:
+            if kind == "disc":   # a via of another net: on every layer
+                if layer is None:
+                    d = math.hypot(g_[0] - geo[0], g_[1] - geo[1]) - r - geo[2]
+                else:
+                    d = _pt_seg(geo[0], geo[1], *g_) - r - geo[2]
+            elif layer is None:
                 d = _pt_seg(g_[0], g_[1], *geo[:4]) - r - geo[4]
             elif layer in ilayers:
                 d = _seg_seg(g_, geo[:4]) - r - geo[4]
@@ -566,65 +605,95 @@ def segment_chains(segs):
     return [g[1] for g in groups]
 
 
-def cut_ends(segs):
+def cut_ends(segs, vias=()):
     """Loose ends of a set of ripped track segments [(layer, x1, y1, x2, y2)]: the points where the
-    rest of the net's copper continues."""
+    rest of the net's copper continues. vias: positions of ripped vias, which joined their layers (a
+    loose end there has layer None)."""
+    def key(layer, x, y):
+        for vx, vy in vias:
+            if abs(x - vx) < 1e-3 and abs(y - vy) < 1e-3:
+                return (None, round(vx, 4), round(vy, 4))
+        return (layer, round(x, 4), round(y, 4))
     count = {}
     for layer, x1, y1, x2, y2 in segs:
-        for q in ((layer, round(x1, 4), round(y1, 4)), (layer, round(x2, 4), round(y2, 4))):
+        for q in (key(layer, x1, y1), key(layer, x2, y2)):
             count[q] = count.get(q, 0) + 1
     return [q for q, n in count.items() if n == 1]
 
 
-def ripup(net, a, c, la, lc, width, goal_radius, deadline):
-    """Route a blocked connection through unlocked tracks of other nets, rip those tracks and route
-    them again around the new one. Everything is undone unless all of it succeeds."""
+def ripup(net, a, c, la, lc, width, goal_radius, deadline, depth=None):
+    """Route a blocked connection through unlocked tracks and vias of other nets, take those out and
+    route them again around the new one; a net that then finds no way may itself move others
+    (depth levels). Everything is rolled back unless all of it succeeds."""
+    depth = ns.rip_depth if depth is None else depth
+    mark = len(journal)
     path = route(net, a, c, la, lc, width, goal_radius, deadline, soft=True)
     if not path:
         say(f"rip-up {net}: no path even through rippable tracks")
         return None
-    n_items, n_holes = len(items), len(holes)
     created = insert(net, path, width)
+    # the new route must stay where it is while the nets it displaced find new ways
+    pinned = {i: items[i] for i in range(len(items) - len(created), len(items))}
+    for i in pinned:
+        items[i] = items[i][:4] + (None,)
     victims = victims_of(created, net)
-    removed, rerouted = [], []
+    # a ripped via takes the unlocked tracks of its net that end on it along (they would dangle)
+    for idx in [i for i in victims if items[i][2] == "disc"]:
+        vnet, (vx, vy) = items[idx][0], items[idx][3][:2]
+        for j, other in enumerate(items):
+            if other is None or j in victims or other[0] != vnet or other[2] != "seg" or other[4] is None:
+                continue
+            sx, sy, ex, ey = other[3][:4]
+            if math.hypot(sx - vx, sy - vy) < 1e-3 or math.hypot(ex - vx, ey - vy) < 1e-3:
+                victims.append(j)
 
-    def undo():
-        for o in created + rerouted:
-            b.Delete(o)
-        for i in range(n_items, len(items)):
-            items[i] = None
-        del holes[n_holes:]
-        for idx, entry in removed:
-            b.Add(entry[4])
-            items[idx] = entry
+    def fail(msg):
+        say(f"rip-up {net}: {msg}")
+        rollback(mark)
         return None
-
     if not victims or len(victims) > ns.max_rip:
-        say(f"rip-up {net}: {len(victims)} tracks in the way (limit {ns.max_rip})")
-        return undo()
-    by_net = {}
+        return fail(f"{len(victims)} tracks/vias in the way (limit {ns.max_rip})")
+    by_net, via_pts, widths = {}, {}, {}
     for idx in victims:
         entry = items[idx]
-        by_net.setdefault(entry[0], []).append((entry[4].GetLayer(),) + tuple(entry[3][:4]))
-        b.Remove(entry[4])
-        removed.append((idx, entry))
-        items[idx] = None
-    widths = {e[0]: e[3][4] * 2 for _i, e in removed}
+        if entry[2] == "disc":
+            via_pts.setdefault(entry[0], []).append(tuple(entry[3][:2]))
+            by_net.setdefault(entry[0], [])
+        else:
+            by_net.setdefault(entry[0], []).append((entry[4].GetLayer(),) + tuple(entry[3][:4]))
+            widths[entry[0]] = entry[3][4] * 2
     if len(by_net) > ns.max_rip_nets:
-        say(f"rip-up {net}: {len(by_net)} nets in the way (limit {ns.max_rip_nets})")
-        return undo()
+        return fail(f"{len(by_net)} nets in the way (limit {ns.max_rip_nets})")
+    for idx in victims:
+        take_out(idx)
     for vnet, segs in by_net.items():
-        ends = cut_ends(segs)
-        if len(ends) != 2:
-            say(f"rip-up {net}: ripped tracks of {vnet} leave {len(ends)} loose ends")
-            return undo()
-        (l1, x1, y1), (l2, x2, y2) = ends
-        p = route(vnet, (x1, y1), (x2, y2), [l1], [l2], widths[vnet], 0.0, deadline)
-        if not p:
-            say(f"rip-up {net}: {vnet} could not be routed again")
-            return undo()
-        rerouted += insert(vnet, p, widths[vnet])
+        ends = cut_ends(segs, via_pts.get(vnet, ()))
+        if len(ends) < 2 or any(e[0] is None for e in ends) or vnet not in widths:
+            return fail(f"ripped tracks of {vnet} leave {len(ends)} loose ends")
+        if not rejoin(vnet, ends, widths[vnet], deadline, depth):
+            return fail(f"{vnet} could not be routed again")
+    for i, entry in pinned.items():   # rippable again for later connections
+        if items[i] is not None:
+            items[i] = entry
     return len(victims), sorted(by_net)
+
+
+def rejoin(net, ends, width, deadline, depth):
+    """Joins the loose ends [(layer, x, y)] a rip-up left in a net: the first two, then every
+    further end to the nearest end already joined (a ripped branch leaves three or more). A join
+    that finds no way may move other nets (one level less deep). False if a join fails; the caller
+    rolls back."""
+    joined = [ends[0]]
+    for e in ends[1:]:
+        t = min(joined, key=lambda q: math.hypot(q[1] - e[1], q[2] - e[2]))
+        p = route(net, (e[1], e[2]), (t[1], t[2]), [e[0]], [t[0]], width, 0.0, deadline)
+        if p:
+            insert(net, p, width)
+        elif depth <= 1 or not ripup(net, (e[1], e[2]), (t[1], t[2]), [e[0]], [t[0]], width, 0.0, deadline,
+                                     depth - 1):
+            return False
+        joined.append(e)
+    return True
 
 
 t_start = time.time()
@@ -991,7 +1060,7 @@ def rebundle(bus_data):
             if pushed:
                 for idx in victims_of(made, net):
                     entry = items[idx]
-                    if entry is None or entry[0] in nets:
+                    if entry is None or entry[0] in nets or entry[2] != "seg":
                         continue
                     b.Remove(entry[4])
                     displaced.append((idx, entry))
