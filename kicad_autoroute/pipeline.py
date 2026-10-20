@@ -119,13 +119,15 @@ def drc_all(pcb: Path) -> Path:
 
 
 def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, rounds: int = 6,
-           buses_json: Path | None = None) -> list[str]:
+           buses_json: Path | None = None, unlock_against: Path | None = None) -> list[str]:
     """Close what the router left: replace necked tracks, last-mile route open connections, drop
-    dangling leftovers and too-close vias, repeat; then clean up the silkscreen."""
+    dangling leftovers and too-close vias, repeat; then clean up the silkscreen. unlock_against: the
+    board before bundles were laid; if connections stay open, the bundles may be ripped up after all."""
     notes = []
     if min_w:
         notes.append(steps("drop_narrow", pcb, min_w))
-    for _ in range(rounds):
+
+    def one_round() -> bool:
         report = pcb.with_name(pcb.stem + "_drc_err.json")
         subprocess.run([str(tools.kicad_cli()), "pcb", "drc", "--refill-zones", "--format", "json", "--severity-error",
                         "-o", str(report), str(pcb)], capture_output=True, text=True, timeout=3600)
@@ -135,8 +137,8 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
         data = json.loads(full.read_text(encoding="utf-8"))
         kinds = {v.get("type") for v in data.get("violations", [])}
         errors = {v.get("type") for v in data.get("violations", []) if v.get("severity") == "error"}
-        if not kinds & {"track_dangling", "via_dangling", "hole_to_hole"} and not errors                 and not data.get("unconnected_items"):
-            break
+        if not kinds & {"track_dangling", "via_dangling", "hole_to_hole"} and not errors and not data.get("unconnected_items"):
+            return True
         notes.append(steps("drop_dangling", pcb, full))
         notes.append(steps("drop_close_vias", pcb, full))
         notes.append(steps("drop_offenders", pcb, full))
@@ -151,8 +153,17 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
         islands = pcb.with_name(pcb.stem + "_islands.json")
         if islands.exists() and json.loads(islands.read_text(encoding="utf-8")).get("unconnected_items"):
             notes.append(kpy(HERE / "lastmile.py", pcb, islands, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
-    # clean-up a person would do: re-route nets with vias where fewer vias suffice; kept only if the
-    # board is not worse afterwards (open connections, DRC errors)
+        return False
+
+    for _ in range(rounds):
+        if one_round():
+            break
+    if unlock_against and drc(pcb)["unconnected"]:
+        # completeness before tidiness: bundles that block the last connections may be ripped up
+        notes.append(steps("unlock_new", pcb, unlock_against))
+        for _ in range(2):
+            if one_round():
+                break
     # clean-up a person would do, each kept only if the board is not worse afterwards (open
     # connections, DRC errors): buses re-laid as bundles, then nets re-routed with fewer vias
     passes = [("rebundle", [buses_json, "--rebundle"])] if buses_json and buses_json.exists() else []
@@ -338,7 +349,10 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
         if found["buses"]:
             buses_json.write_text(json.dumps(found), encoding="utf-8")
             bus_pre = copy_project(pre, work / "board_bus", name)
+            # long buses need a larger search budget than single connections; a coarser grid keeps it fast
             log(kpy(HERE / "lastmile.py", bus_pre, buses_json, "--buses", "--min-width", min_track_width(pro, dru),
+                    "--max-cells", 200000, "--max-expansions", 1500000, "--time-budget", 1500,
+                    *([] if cfg.get("buses", {}).get("lock", True) else ["--unlocked"]),
                     timeout=1800, fatal=False))
             dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
             log(steps("export", bus_pre, dsn_bus))
@@ -384,9 +398,13 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     if dsn_bus is not None:
         dsns.append((dsn_bus, "_bus"))
     # the plain variant gets most runs (it gets furthest on hard boards): half of them, and three in
-    # four when there is only one other variant; the others alternate
+    # four when there is only one other style variant; the others alternate. Pre-laid buses alone
+    # (multilayer boards) get half: their runs are the only ones that can keep the buses bundled.
     others = list(range(1, len(dsns)))
-    pattern = [0, 0, 0, others[0]] if len(others) == 1 else [v for other in others for v in (0, other)] or [0]
+    if len(others) == 1 and dsns[1][1] != "_bus":
+        pattern = [0, 0, 0, 1]
+    else:
+        pattern = [v for other in others for v in (0, other)] or [0]
 
     def make_jobs(first, last):
         out = []
@@ -434,7 +452,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     for cand in pick_candidates(scored, finish_cfg.get("candidates", 2)):
         pcb = Path(cand["board"])
         notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False),
-                       buses_json=buses_json)
+                       buses_json=buses_json, unlock_against=pre if Path(cand["ses"]).stem.endswith("_bus") else None)
         r = drc(pcb)
         r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
         r["off_share"] = off_share(r, main_layer)

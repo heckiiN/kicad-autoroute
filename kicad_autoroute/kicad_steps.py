@@ -1,6 +1,7 @@
 """Board edits for the pipeline, run with KiCad's python (pcbnew).
 
   <kicad-python> kicad_steps.py strip  board.kicad_pcb [--keep-locked] [--zones]
+  <kicad-python> kicad_steps.py unlock_new board.kicad_pcb reference.kicad_pcb
   <kicad-python> kicad_steps.py apply  board.kicad_pcb placement.json
   <kicad-python> kicad_steps.py zones  board.kicad_pcb '[{"net": "GND", "layers": ["In1.Cu"]}]' [--inset 0.3]
   <kicad-python> kicad_steps.py export board.kicad_pcb out.dsn [--raw]
@@ -13,6 +14,7 @@
   <kicad-python> kicad_steps.py layer_pref board.kicad_pcb GND
 
 strip   removes tracks and vias (optionally keeps locked ones, i.e. intentional hand routes)
+unlock_new  unlocks locked tracks/vias the reference board does not have (the pipeline's own bundles)
 apply   moves footprints to the KiCad-frame positions of a placement JSON and, when the JSON has an
         "outline_mm" rectangle, replaces Edge.Cuts with it
 zones   adds solid zones of a net on the given layers over the board outline (skips existing ones of
@@ -44,6 +46,26 @@ def strip(path, keep_locked=False, zones=False):
         gone += 1
     b.Save(path)
     print(f"strip: removed {gone} tracks/vias")
+
+
+def unlock_new(path, reference):
+    """Unlock the locked tracks and vias that the reference board does not have (bundles the
+    pipeline laid itself); the user's own locked routes stay locked."""
+    def key(t):
+        if t.GetClass() == "PCB_VIA":
+            return ("via", t.GetNetname(), round(TO(t.GetPosition().x), 3), round(TO(t.GetPosition().y), 3))
+        ends = sorted([(round(TO(t.GetStart().x), 3), round(TO(t.GetStart().y), 3)),
+                       (round(TO(t.GetEnd().x), 3), round(TO(t.GetEnd().y), 3))])
+        return ("track", t.GetNetname(), t.GetLayer(), *ends)
+    users = {key(t) for t in pcbnew.LoadBoard(reference).GetTracks() if t.IsLocked()}
+    b = pcbnew.LoadBoard(path)
+    n = 0
+    for t in b.GetTracks():
+        if t.IsLocked() and key(t) not in users:
+            t.SetLocked(False)
+            n += 1
+    b.Save(path)
+    print(f"unlock_new: {n} tracks/vias of laid bundles unlocked")
 
 
 def apply(path, plan_path):
@@ -270,6 +292,8 @@ if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "strip":
         strip(args[0], "--keep-locked" in args, "--zones" in args)
+    elif cmd == "unlock_new":
+        unlock_new(args[0], args[1])
     elif cmd == "apply":
         apply(args[0], args[1])
     elif cmd == "zones":

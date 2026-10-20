@@ -6,7 +6,8 @@ Freerouting does the actual routing. kicad-autoroute does everything around it t
 the result passes KiCad's DRC:
 
 - it hands Freerouting the board's **real rules** (KiCad's Specctra export drops several of them),
-- prepares what Freerouting is bad at (escapes from fine-pitch pads, stitching vias into planes),
+- prepares what Freerouting is bad at (escapes from fine-pitch pads, stitching vias into planes,
+  buses laid as parallel bundles),
 - routes **several seeds in parallel** and scores each result with **KiCad's own DRC**,
 - and closes what is left with a small **rule-checking last-mile router** and a clean-up pass.
 
@@ -19,28 +20,37 @@ ends up in `autoroute-my_board/result/`.
 
 ## Status: honest numbers
 
-This is an early version (0.1). It reliably beats the plain Freerouting plugin workflow, but it does
-**not** finish every board: on larger boards some connections stay open and have to be routed by hand.
+This is an early version (0.1). It reliably beats the plain Freerouting plugin workflow and finishes
+five of KiCad's six demo boards completely, but it does **not** finish every board: on large dense
+boards a few connections can stay open and have to be routed by hand.
 
 KiCad's demo boards, default settings, no per-board tuning, run with `benchmark/run_benchmark.py`
-(full output in `docs/benchmark-2026-10-18d.md`, plugin-workflow numbers from `docs/benchmark-2026-10-17.md`); the last row
+(full output in `docs/benchmark-2026-10-20d.md`, plugin-workflow numbers from `docs/benchmark-2026-10-17.md`); the last row
 is a private board, routed in an earlier version with the same settings.
 Cells: unconnected / DRC errors, counted by KiCad's DRC after refilling zones.
 
 | Board | Layers / parts | Original (hand-routed) | Freerouting plugin workflow¹ | **kicad-autoroute** | Time |
 |---|---|---|---|---|---|
 | ecc83 | 2 / 15 | 0 / 0 | 0 / 0 | **0 / 0** | 2 min |
-| sonde xilinx | 2 / 25 | 0 / 0 | 2 / 2 | **0 / 0** | 3 min |
-| pic_programmer | 2 / 63 | 0 / 0 | 2 / 2 | **0 / 0** | 4 min |
-| interf_u | 2 / 25 | 0 / 2 | 13 / 5 | **3 / 6**² ³ | 10 min |
-| multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **1 / 0**³ | 9 min |
-| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **6 / 0**³ | 24 min |
-| private board (HV rules) | 4 / 491 | 0 / 0 | no result in 1 h | **83 / 2**² | 2.6 h |
+| sonde xilinx | 2 / 25 | 0 / 0 | 2 / 2 | **0 / 0** | 4 min |
+| pic_programmer | 2 / 63 | 0 / 0 | 2 / 2 | **0 / 0** | 5 min |
+| interf_u | 2 / 25 | 0 / 2 | 13 / 5 | **0 / 0** | 11 min |
+| multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **0 / 0** | 12 min |
+| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **1 / 0**² | 69 min |
+| private board (HV rules) | 4 / 491 | 0 / 0 | no result in 1 h | **83 / 2**³ | 2.6 h |
 
 ¹ Tracks removed, KiCad's Specctra export, Freerouting 2.4.1 with up to 100 passes, session imported back.
-² The remaining errors are "starved thermal" reliefs on the ground pour (the hand-routed interf_u has two itself).
-³ Results vary between runs (Freerouting's passes depend on timing); earlier runs left 2–6 open on interf_u, 1–2 on
-  multichannel and 6–14 on coldfire.
+² Results vary between runs (Freerouting's passes depend on timing); recent runs left 1–3 open.
+³ An earlier version; the remaining errors were "starved thermal" reliefs on the ground pour.
+
+### Does it look hand-made?
+
+Complete is not the same as tidy. `benchmark/scorecard.py` compares every routed board with its
+hand-routed original: complete (0 open, 0 errors), at most 1.1 × the human's vias + 2, buses (runs of
+neighbouring pins between two parts) at least as bundled as the human laid them (share of bus length
+running alongside its neighbour, human − 0.05), and on 2-layer boards as much copper on the main side
+(human − 0.10). Five of six demo boards pass all four; kit-dev-coldfire does not yet (1 open, 281
+instead of at most 280 vias, its buses 0.26 bundled against the human's 0.80).
 
 Measured on Windows 10, KiCad 10.0, 4 seeds × 20 min, 16 cores. `tinytapeout-demo` is left out:
 KiCad's Python API does not load it within 15 minutes on this machine.
@@ -55,9 +65,10 @@ KiCad's Python API does not load it within 15 minutes on this machine.
 | escape | fine-pitch pads of nets that need wide copper get a short narrow stub and a via, where Freerouting would neck the trace below the rules or give up |
 | stitch | SMD pads of the plane net (GND by default) get a via into the pour |
 | export + rule fix | Specctra export, then corrected: via sizes raised to the board's minimum diameter/drill/annular ring, net-class widths/clearances raised to the board minimums, custom `.kicad_dru` clearance rules (net-name wildcards, net classes) turned into router classes, placement rooms that forbid nothing no longer exported as keepouts |
+| buses | runs of neighbouring pins between two parts (found in the netlist) are laid as parallel bundles on a copy of the board, middle net first with room for the rest, the others in a corridor next to their neighbour; the bundled copy is a routing variant of its own |
 | route | Freerouting on N item-order seeds in parallel, stopping when passes stop improving; while a wave of runs takes under two minutes, more seeds are added (up to 12), which evens out Freerouting's run-to-run spread on small boards. 2-layer boards also get two layout styles people use: most copper on a main side (the SMD side, or the solder side of a through-hole board) with the other side for crossings, and single-sided with jumpers |
 | score | every result is imported into KiCad, zones refilled, KiCad DRC; ranked by unconnected, errors, vias, share of copper off the main side, length. The best result of each style that is within reach gets finished |
-| finish | for the best candidates: drop necked/dangling/offending items, last-mile router for what is open, vias for cut-off pour islands, silkscreen clean-up; repeated a few rounds. The last-mile router works on a grid with its own clearance checks (copper text included), prefers straight runs with 45°/90° corners, joins cut-off pads to the nearest piece of their pour, retries tight passages on a finer grid, and can rip up a few unlocked tracks of other nets and route them again (undone unless everything fits) |
+| finish | for the best candidates: drop necked/dangling/offending items, last-mile router for what is open, vias for cut-off pour islands, silkscreen clean-up; repeated a few rounds. The last-mile router works on a grid with its own clearance checks (copper text included), prefers straight runs with 45°/90° corners, joins cut-off pads to the nearest piece of their pour, retries tight passages on a finer grid, and can rip up a few unlocked tracks of other nets and route them again (undone unless everything fits). Then the clean-up a person would do, each step kept only if the board does not get worse: buses re-laid as bundles (pushing other tracks aside), nets re-routed with fewer vias |
 | report | `result/<board>.kicad_pcb`, `report.json`, optional 3D renders |
 
 ## Install

@@ -117,7 +117,7 @@ for t in b.GetTracks():
                       t if t.GetClass() == "PCB_TRACK" and not t.IsLocked() else None))
 
 
-def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all"):
+def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all", grid_margin=0.75):
     """Per layer boolean grid: True where a trace centre of half width half_w would violate clearance.
     which: "all" items, only "hard" ones (fixed copper) or only "soft" ones (rippable tracks)."""
     xs = x0 + np.arange(nx) * g
@@ -132,7 +132,7 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all"):
             continue
         # paths run straight between free cell centres; such a segment comes at most half a diagonal
         # step (0.71 g) closer to an obstacle than its end points
-        m = need(net, inet) + half_w + 0.75 * g
+        m = need(net, inet) + half_w + grid_margin * g
         if kind == "box":
             bx0, by0, bx1, by1 = geo
             lo_x, lo_y, hi_x, hi_y = bx0 - m, by0 - m, bx1 + m, by1 + m
@@ -236,10 +236,14 @@ def zone_target(zone, start, zone_layers):
 
 
 def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), soft=False, fine=False,
-          attract=None, pitch=0.0):
+          attract=None, pitch=0.0, corridor=0.0, reserve=0.0):
     """Grid A* from a to b_pt. With soft=True unlocked tracks of other nets are passable at a cost
     (rip-up search); otherwise they block like everything else. attract: segments [(layer, x1, y1,
-    x2, y2)] of a neighbour (bus); cells at `pitch` from them are cheaper, so the path runs alongside."""
+    x2, y2)] of a neighbour (bus); cells at `pitch` from them are cheaper, so the path runs alongside.
+    corridor > 0: the path may only leave the neighbour by that much (on the neighbour's layers), except
+    around its own two ends where it fans out from the pads; a bus then stays a bundle.
+    reserve > 0: away from its ends the path keeps that much more room on both sides (the middle net
+    of a bus, so the whole bundle fits next to it)."""
     # long connections search on a coarser grid (at most MAX_CELLS per layer); the clearance margin
     # grows with the grid step, so a coarse path is still legal
     w_mm = abs(a[0] - b_pt[0]) + 2 * ns.window
@@ -253,13 +257,30 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
     ny = int((max(a[1], b_pt[1]) + ns.window - y0) / g) + 1
     tmaps = blocked_map(net, x0, y0, nx, ny, g, width / 2, "hard" if soft else "all")
     smaps = blocked_map(net, x0, y0, nx, ny, g, width / 2, "soft") if soft else None
+    # a pad in a fine-pitch row (QFP) can only be left along its own axis, where the clearance to its
+    # neighbours is just met; the grid margin would close that way on a coarse grid, so right around
+    # the two ends the map uses a quarter of that margin (paths leave a pad straight, not diagonally)
+    r_esc = 1.5
+    for px, py in (a, b_pt):
+        i0, i1 = max(0, int((px - r_esc - x0) / g)), min(nx, int((px + r_esc - x0) / g) + 2)
+        j0, j1 = max(0, int((py - r_esc - y0) / g)), min(ny, int((py + r_esc - y0) / g) + 2)
+        if i0 < i1 and j0 < j1:
+            local = blocked_map(net, x0 + i0 * g, y0 + j0 * g, i1 - i0, j1 - j0, g, width / 2,
+                                "hard" if soft else "all", grid_margin=0.25)
+            for l in layers:
+                tmaps[l][j0:j1, i0:i1] &= local[l]
+    xs = x0 + np.arange(nx) * g
+    ys = y0 + np.arange(ny) * g
+    X, Y = np.meshgrid(xs, ys)
+    if reserve > 0:
+        wide = blocked_map(net, x0, y0, nx, ny, g, width / 2 + reserve, "hard" if soft else "all")
+        r_end = 3.0 + 2 * reserve   # out of a pin field first (two rows of a header need ~5 mm)
+        ends = (np.hypot(X - a[0], Y - a[1]) <= r_end) | (np.hypot(X - b_pt[0], Y - b_pt[1]) <= r_end)
+        tmaps = {l: np.where(ends, tmaps[l], wide[l]) for l in layers}
     rip_cell = ns.rip_cost / g
     vr = ns.via[0] / 2
     vmaps = blocked_map(net, x0, y0, nx, ny, g, vr)
     via_ok = ~np.any(np.stack([vmaps[l] for l in layers]), axis=0)
-    xs = x0 + np.arange(nx) * g
-    ys = y0 + np.arange(ny) * g
-    X, Y = np.meshgrid(xs, ys)
     for hx, hy, hr in holes:
         reach = hr + ns.via[1] / 2 + ns.hole_clearance
         i0, i1 = max(0, int((hx - reach - x0) / g)), min(nx, int((hx + reach - x0) / g) + 2)
@@ -267,6 +288,31 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
         if i0 < i1 and j0 < j1:
             via_ok[j0:j1, i0:i1] &= np.hypot(X[j0:j1, i0:i1] - hx, Y[j0:j1, i0:i1] - hy) >= reach
     li = {l: i for i, l in enumerate(layers)}
+    if attract and corridor > 0:
+        tmaps = dict(tmaps)
+        inside = {l: np.zeros((ny, nx), bool) for l in layers}
+        segs = [s_ for s_ in attract if s_[0] in inside]
+
+        def dist_to(px, py):
+            return min((_pt_seg(px, py, *s_[1:]) for s_ in segs), default=float("inf"))
+        for layer, sx, sy, ex, ey in segs:
+            m = corridor
+            i0, i1 = max(0, int((min(sx, ex) - m - x0) / g)), min(nx, int((max(sx, ex) + m - x0) / g) + 2)
+            j0, j1 = max(0, int((min(sy, ey) - m - y0) / g)), min(ny, int((max(sy, ey) + m - y0) / g) + 2)
+            if i0 >= i1 or j0 >= j1:
+                continue
+            Xs, Ys = X[j0:j1, i0:i1], Y[j0:j1, i0:i1]
+            dx, dy = ex - sx, ey - sy
+            L2 = dx * dx + dy * dy
+            t = np.clip(((Xs - sx) * dx + (Ys - sy) * dy) / L2, 0, 1) if L2 > 0 else 0
+            inside[layer][j0:j1, i0:i1] |= np.hypot(Xs - (sx + t * dx), Ys - (sy + t * dy)) <= m
+        for (px, py) in (a, b_pt):   # fan-out room around each pad, on every layer
+            r = max(4.0, dist_to(px, py) + 2.5)
+            disc = np.hypot(X - px, Y - py) <= r
+            for l in layers:
+                inside[l] |= disc
+        for l in layers:
+            tmaps[l] = tmaps[l] | ~inside[l]
 
     def cell(p):
         return int(round((p[0] - x0) / g)), int(round((p[1] - y0) / g))
@@ -299,12 +345,12 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
     hard = [tmaps[layers[k]].tobytes() for k in range(L)]
     near = None
     if attract:
-        # the lane next to the neighbour: centre distance pitch .. pitch + 1.5 grid steps
+        # the lane next to the neighbour: centre distance pitch .. pitch + 2.5 grid steps
         lanes = {l: np.zeros((ny, nx), bool) for l in layers}
         for layer, sx, sy, ex, ey in attract:
             if layer not in lanes:
                 continue
-            m = pitch + 1.5 * g
+            m = pitch + 2.5 * g   # clearance blocks up to pitch + 0.75 g; leave a lane of ~2 steps
             i0, i1 = max(0, int((min(sx, ex) - m - x0) / g)), min(nx, int((max(sx, ex) + m - x0) / g) + 2)
             j0, j1 = max(0, int((min(sy, ey) - m - y0) / g)), min(ny, int((max(sy, ey) + m - y0) / g) + 2)
             if i0 >= i1 or j0 >= j1:
@@ -319,7 +365,7 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
     soft = [smaps[layers[k]].tobytes() for k in range(L)] if smaps is not None else None
     vias = via_ok.tobytes()
 
-    def search(directional, weight, limit):
+    def search(directional, weight, limit, band=None):
         """A* over (x, y, layer, last direction). Without directions it is a quick feasibility test:
         a ninth of the states, so a connection that cannot be made fails fast."""
         start = [(sc[0], sc[1], li[l], NONE) for l in la]
@@ -331,7 +377,7 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
         while heap:
             expanded += 1
             if expanded > limit or (expanded % 5000 == 0 and time.time() > deadline):
-                say(f"  search {net}: gave up after {expanded} steps (grid {g:.3f} mm, {nx}x{ny})")
+                say(f"  search {net}{' (corners)' if directional else ''}: gave up after {expanded} steps (grid {g:.3f} mm, {nx}x{ny})")
                 return None, prev
             f, d, node = heapq.heappop(heap)
             x, y, k, last = node
@@ -351,7 +397,7 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
                 if not (0 <= nx_ < nx and 0 <= ny_ < ny):
                     continue
                 cell_ = ny_ * nx + nx_
-                if hk[cell_]:
+                if hk[cell_] or (band is not None and not band[cell_]):
                     continue
                 if sk is not None and sk[cell_]:
                     c += rip_cell
@@ -378,9 +424,19 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
 
     found, prev = search(False, 1.0, ns.max_expansions)
     if found is not None:
-        # a path exists: search again with corner costs, aimed a little harder at the goal; keep the
-        # plain path if that search runs out of budget
-        found2, prev2 = search(True, 1.2, ns.max_expansions)
+        # a path exists: search again with corner costs, aimed a little harder at the goal, within a
+        # band around the first path (a ninth of the states per cell, so the band keeps it affordable);
+        # keep the plain path if that search runs out of budget
+        mask = np.zeros((ny, nx), bool)
+        r = max(4, int(1.0 / g))
+        node = found
+        while True:
+            x, y = node[0], node[1]
+            mask[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1] = True
+            if node not in prev:
+                break
+            node = prev[node]
+        found2, prev2 = search(True, 1.2, 2 * ns.max_expansions, mask.tobytes())
         if found2 is not None:
             found, prev = found2, prev2
     if not found:
@@ -492,6 +548,22 @@ def victims_of(new_items, net):
                 found.append(idx)
                 break
     return found
+
+
+def segment_chains(segs):
+    """Split segments [(layer, x1, y1, x2, y2)] into groups that touch end to end."""
+    key = lambda l, x, y: (l, round(x, 4), round(y, 4))
+    groups = []
+    for seg in segs:
+        ends = {key(seg[0], seg[1], seg[2]), key(seg[0], seg[3], seg[4])}
+        touching = [g for g in groups if ends & g[0]]
+        merged = ([seg], set(ends))
+        for g in touching:
+            merged[0].extend(g[1])
+            merged[1].update(g[0])
+            groups.remove(g)
+        groups.append((merged[1], merged[0]))
+    return [g[1] for g in groups]
 
 
 def cut_ends(segs):
@@ -745,6 +817,42 @@ def reduce_vias(max_pads=8, via_cost_mm=12.0):
     return kept
 
 
+def bundle_order(nets):
+    """A bus is laid from its middle net outwards: [(net, neighbour it runs next to)], the middle
+    net first with no neighbour, then alternately one further out on each side."""
+    m = (len(nets) - 1) // 2
+    order = [(nets[m], None)]
+    for k in range(1, len(nets)):
+        if m - k >= 0:
+            order.append((nets[m - k], nets[m - k + 1]))
+        if m + k < len(nets):
+            order.append((nets[m + k], nets[m + k - 1]))
+    return order
+
+
+def follow(net, a, b_pt, la, lb, width, prev, pitch, reserve=0.0):
+    """Route one net of a bus. Next to its neighbour (prev): first inside a corridor along it (the
+    bundle stays together), then, if the corridor is blocked, anywhere with the lane only preferred.
+    The middle net (no neighbour) first keeps room for the rest of the bundle on both sides."""
+    deadline = t_start + ns.time_budget
+    if prev:
+        path = route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch,
+                     corridor=max(1.5, 3 * pitch))
+        if path:
+            return path
+        say(f"  {net}: corridor along its neighbour blocked, routing freely")
+    elif reserve > 0:
+        path = route(net, a, b_pt, la, lb, width, 0.0, deadline, reserve=reserve)
+        if path:
+            return path
+        say(f"  {net}: no room for the whole bundle, routing the middle net alone")
+    return route(net, a, b_pt, la, lb, width, 0.0, deadline, attract=prev, pitch=pitch)
+
+
+def bus_pitch(nets):
+    return max(classes.width(n) for n in nets) + max(need(x, y) for x, y in zip(nets, nets[1:]))
+
+
 def route_buses(bus_data):
     """Lay every bus as a bundle: its nets in pin order, each one drawn to the lane right next to
     the previous one. The bundles are locked, so the autorouter routes around them."""
@@ -769,30 +877,43 @@ def route_buses(bus_data):
 
     # short buses first: they are local, almost always fit, and leave the long ones the most room;
     # a bus that cannot be laid completely is taken up again and left to the autorouter
+    joined = {}   # net -> sets of parts already joined by laid bundles (a third bus would close a loop)
+
+    def group(net, ref):
+        return next((s_ for s_ in joined.get(net, []) if ref in s_), {ref})
+
     for bus in sorted(bus_data.get("detail", []), key=span_of):
         if time.time() > t_start + ns.time_budget:
             break
+        if any(bus["to"] in group(n, bus["from"]) for n in bus["nets"]):
+            say(f"bus {bus['from']}->{bus['to']}: its parts are already joined by other bundles")
+            continue
         n_items, n_holes = len(items), len(holes)
-        prev, prev_net, laid = None, None, []
-        for net in bus["nets"]:
+        segs_of, laid = {}, []
+        pitch_all = bus_pitch(bus["nets"])
+        for net, nb in bundle_order(bus["nets"]):
             e = ends(bus, net)
             if e is None:
                 laid = None
                 break
             a_, la_, b_, lb_ = e
             w = classes.width(net)
-            pitch = w + need(net, prev_net) if prev_net else 0.0
-            path = route(net, a_, b_, la_, lb_, w, 0.0, t_start + ns.time_budget, attract=prev, pitch=pitch)
+            pitch = w + need(net, nb) if nb else 0.0
+            path = follow(net, a_, b_, la_, lb_, w, segs_of.get(nb), pitch,
+                          reserve=math.ceil((len(bus["nets"]) - 1) / 2) * pitch_all)
             if not path:
                 say(f"bus {bus['from']}->{bus['to']}: {net} does not fit, bus left to the autorouter")
                 laid = None if not laid else laid + [None]
                 break
             new = insert(net, path, w)
             laid += new
-            prev = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y))
-                    for o in new if o.GetClass() == "PCB_TRACK"]
-            prev_net = net
+            segs_of[net] = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x),
+                             TO(o.GetEnd().y)) for o in new if o.GetClass() == "PCB_TRACK"]
         if laid and None not in laid:
+            for n in bus["nets"]:
+                sets = joined.setdefault(n, [])
+                ga, gb = group(n, bus["from"]), group(n, bus["to"])
+                sets[:] = [s_ for s_ in sets if s_ is not ga and s_ is not gb] + [ga | gb]
             for o in laid:
                 o.SetLocked(not ns.unlocked)
             report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets'])} nets")
@@ -840,23 +961,43 @@ def rebundle(bus_data):
         for o in old:
             b.Remove(o)
         n_items, n_holes = len(items), len(holes)
-        new, prev, prev_net, ok = [], None, None, True
-        for net in nets:
+        new, ok, segs_of = [], True, {}
+        displaced = []   # (index, entry) of other nets' tracks a bundle pushed aside
+        pitch_all = bus_pitch(nets)
+        for net, nb in bundle_order(nets):
             pa, pb = pad_of[(bus["from"], net)], pad_of[(bus["to"], net)]
             a_ = (TO(pa.GetPosition().x), TO(pa.GetPosition().y))
             b_ = (TO(pb.GetPosition().x), TO(pb.GetPosition().y))
             w = classes.width(net)
-            path = route(net, a_, b_, [l for l in layers if pa.IsOnLayer(l)], [l for l in layers if pb.IsOnLayer(l)],
-                         w, 0.0, t_start + ns.time_budget, attract=prev, pitch=(w + need(net, prev_net)) if prev_net else 0.0)
+            lane_args = dict(attract=segs_of.get(nb), pitch=(w + need(net, nb)) if nb else 0.0)
+            la_b, lb_b = [l for l in layers if pa.IsOnLayer(l)], [l for l in layers if pb.IsOnLayer(l)]
+            path = follow(net, a_, b_, la_b, lb_b, w, lane_args["attract"], lane_args["pitch"],
+                          reserve=math.ceil((len(nets) - 1) / 2) * pitch_all)
+            pushed = False
+            if not path and ns.max_rip > 0:
+                # no free lane: the bundle may push unlocked tracks of other nets aside
+                path = route(net, a_, b_, la_b, lb_b, w, 0.0, t_start + ns.time_budget, soft=True, **lane_args)
+                pushed = path is not None
             if not path:
                 say(f"rebundle {bus['from']}->{bus['to']}: {net} finds no lane")
                 ok = False
                 break
+            first = len(items)
             made = insert(net, path, w)
             new += made
-            prev = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y))
-                    for o in made if o.GetClass() == "PCB_TRACK"]
-            prev_net = net
+            for k in range(first, len(items)):   # the bundle itself must not be pushed aside
+                if items[k] is not None:
+                    items[k] = items[k][:4] + (None,)
+            if pushed:
+                for idx in victims_of(made, net):
+                    entry = items[idx]
+                    if entry is None or entry[0] in nets:
+                        continue
+                    b.Remove(entry[4])
+                    displaced.append((idx, entry))
+                    items[idx] = None
+            segs_of[net] = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x),
+                             TO(o.GetEnd().y)) for o in made if o.GetClass() == "PCB_TRACK"]
             # the net's other pads (a pull-up, a second part) join the nearest pad already connected
             joined = [pa, pb]
             for extra_pad in [q for q in net_pads[net] if q.m_Uuid.AsString() not in
@@ -872,6 +1013,28 @@ def rebundle(bus_data):
                 joined.append(extra_pad)
             if not ok:
                 break
+        if ok and displaced:
+            # the pushed-aside nets are routed again between the loose ends their tracks left
+            by_net = {}
+            for _idx, entry in displaced:
+                by_net.setdefault(entry[0], []).append((entry[4].GetLayer(),) + tuple(entry[3][:4]))
+            for vnet, segs in by_net.items():
+                width = next(e[3][4] * 2 for _i, e in displaced if e[0] == vnet)
+                for chain in segment_chains(segs):
+                    loose = cut_ends(chain)
+                    if len(loose) != 2:
+                        ok = False
+                        break
+                    (l1, x1, y1), (l2, x2, y2) = loose
+                    again = route(vnet, (x1, y1), (x2, y2), [l1], [l2], width, 0.0, t_start + ns.time_budget)
+                    if not again:
+                        ok = False
+                        break
+                    new += insert(vnet, again, width)
+                if not ok:
+                    break
+            say(f"rebundle {bus['from']}->{bus['to']}: pushed {len(displaced)} tracks of {len(by_net)} nets aside, "
+                f"{'re-routed' if ok else 'could not re-route them'}")
         if ok:
             after, _len = bus_tools.parallelism(b, sub_bus)
             say(f"rebundle {bus['from']}->{bus['to']} ({len(nets)} nets): parallel {before:.2f} -> {after:.2f}")
@@ -891,6 +1054,9 @@ def rebundle(bus_data):
             b.Add(o)
         for i, it in removed_items:
             items[i] = it
+        for i, entry in displaced:
+            b.Add(entry[4])
+            items[i] = entry
     open_connections()
     return kept
 

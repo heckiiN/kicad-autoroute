@@ -43,6 +43,8 @@ post_as_planes = true   # tell the router about post-route pours already (faster
 [buses]
 enabled = true          # buses (runs of nets between two parts, found in the netlist) laid as parallel
                         # bundles before routing; a routing variant, chosen only when it is as complete
+lock = true             # the autorouter routes around the bundles; if connections stay open at the
+                        # end, the finishing pass may still rip them up
 
 [freerouting]
 seeds = 4               # runs with different item orders; the best one wins
