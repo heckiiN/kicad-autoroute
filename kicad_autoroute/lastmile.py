@@ -48,6 +48,11 @@ ap.add_argument("--through", action="store_true",
                 help="bus mode on a routed board: the bus nets' own routes are taken up first, and the bundles "
                      "may pass through other nets' unlocked tracks; those are taken out for the autorouter to "
                      "route again")
+ap.add_argument("--fan-radius", type=float, default=4.0,
+                help="bus mode: around its own pads a net may leave its neighbour's corridor this far (mm)")
+ap.add_argument("--demand", type=float, default=0.0,
+                help="bus mode: steer bundles away from where many other connections must pass (weight of the "
+                     "demand map built from the other nets' air lines; 0: off)")
 ap.add_argument("--max-push", type=int, default=25,
                 help="--through: tracks/vias of other nets one bus may push aside")
 ap.add_argument("--trim-fanout", type=float, default=0.0,
@@ -249,6 +254,46 @@ def zone_target(zone, start, zone_layers):
     return (best[1], best[2]) if best else (None, None)
 
 
+# demand map (1 mm cells over the board outline): how many air lines of other nets cross each cell;
+# route() makes a cell dearer by 1 + DEMAND_W * demand when it is set (bus bundles)
+DEMAND, DEMAND_W = None, 0.0
+
+
+def build_demand(exclude):
+    """Air lines of every routable net except `exclude` (and nets with a pour), as a minimum spanning
+    tree over its pads, rasterised onto 1 mm cells and smoothed."""
+    poured_nets = {z.GetNetname() for z in b.Zones() if not z.GetIsRuleArea()}
+    x0, y0, x1, y1 = EDGE
+    nx, ny = int(x1 - x0) + 2, int(y1 - y0) + 2
+    grid = np.zeros((ny, nx))
+    pads = {}
+    for f in b.GetFootprints():
+        for p in f.Pads():
+            n = p.GetNetname()
+            if n and n not in exclude and n not in poured_nets:
+                pads.setdefault(n, []).append((TO(p.GetPosition().x), TO(p.GetPosition().y)))
+    for pts in pads.values():
+        if len(pts) < 2 or len(pts) > 40:
+            continue
+        joined, rest = [pts[0]], pts[1:]
+        while rest:   # Prim: the shortest edge from the joined pads to a new one
+            a, c = min(((u, v) for u in joined for v in rest),
+                       key=lambda e: math.hypot(e[0][0] - e[1][0], e[0][1] - e[1][1]))
+            joined.append(c)
+            rest.remove(c)
+            L = math.hypot(c[0] - a[0], c[1] - a[1])
+            cells = set()
+            for k in range(int(L / 0.5) + 1):
+                t = k * 0.5 / L if L else 0
+                cells.add((int(a[1] + t * (c[1] - a[1]) - y0), int(a[0] + t * (c[0] - a[0]) - x0)))
+            for cy, cx in cells:
+                if 0 <= cy < ny and 0 <= cx < nx:
+                    grid[cy, cx] += 1
+    # air lines within about 2.5 mm of a cell (they are not where the tracks will run exactly)
+    padded = np.pad(grid, 2, mode="edge")
+    return sum(padded[i:i + ny, j:j + nx] for i in range(5) for j in range(5))
+
+
 def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), soft=False, fine=False,
           attract=None, pitch=0.0, corridor=0.0, reserve=0.0):
     """Grid A* from a to b_pt. With soft=True unlocked tracks of other nets are passable at a cost
@@ -302,6 +347,11 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
         if i0 < i1 and j0 < j1:
             via_ok[j0:j1, i0:i1] &= np.hypot(X[j0:j1, i0:i1] - hx, Y[j0:j1, i0:i1] - hy) >= reach
     li = {l: i for i, l in enumerate(layers)}
+    dem = None
+    if DEMAND is not None and DEMAND_W > 0:
+        ix = np.clip((X - EDGE[0]).astype(int), 0, DEMAND.shape[1] - 1)
+        iy = np.clip((Y - EDGE[1]).astype(int), 0, DEMAND.shape[0] - 1)
+        dem = (1.0 + DEMAND_W * DEMAND[iy, ix]).ravel().tolist()
     if attract and corridor > 0:
         tmaps = dict(tmaps)
         inside = {l: np.zeros((ny, nx), bool) for l in layers}
@@ -321,7 +371,7 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
             t = np.clip(((Xs - sx) * dx + (Ys - sy) * dy) / L2, 0, 1) if L2 > 0 else 0
             inside[layer][j0:j1, i0:i1] |= np.hypot(Xs - (sx + t * dx), Ys - (sy + t * dy)) <= m
         for (px, py) in (a, b_pt):   # fan-out room around each pad, on every layer
-            r = max(4.0, dist_to(px, py) + 2.5)
+            r = max(ns.fan_radius, dist_to(px, py) + ns.fan_radius / 2)
             disc = np.hypot(X - px, Y - py) <= r
             for l in layers:
                 inside[l] |= disc
@@ -417,6 +467,8 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
                     c += rip_cell
                 if near is not None and near[k][cell_]:
                     c *= ns.lane_discount
+                if dem is not None:
+                    c *= dem[cell_]
                 nb = (nx_, ny_, k, i if directional else NONE)
                 nd = d + c
                 if nd < dist.get(nb, 1e18):
@@ -1089,6 +1141,11 @@ def route_buses(bus_data):
     def group(net, ref):
         return next((s_ for s_ in joined.get(net, []) if ref in s_), {ref})
 
+    global DEMAND, DEMAND_W
+    if ns.demand > 0:
+        DEMAND = build_demand({n for bus in bus_data.get("detail", []) for n in bus["nets"]})
+        DEMAND_W = ns.demand
+        say(f"demand map: max {DEMAND.max():.1f}, mean {DEMAND.mean():.2f} air lines per mm cell")
     if ns.through:
         import buses as bus_tools
     for bus in sorted(bus_data.get("detail", []), key=span_of):
@@ -1111,16 +1168,29 @@ def route_buses(bus_data):
         n_items, n_holes = len(items), len(holes)
         segs_of, laid, pushed = {}, [], 0
         pitch_all = bus_pitch(bus["nets"])
+        skipped_nets = []
+        order_ = bus["nets"]
         for net, nb in bundle_order(bus["nets"]):
             e = ends(bus, net)
             if e is None:
                 laid = None
                 break
+            if nb is not None and nb not in segs_of:
+                # its inner neighbour did not fit: run next to the nearest laid net on that side
+                i_net, i_nb = order_.index(net), order_.index(nb)
+                step = 1 if i_nb > i_net else -1
+                nb = next((order_[k] for k in range(i_nb, len(order_) if step > 0 else -1, step)
+                           if order_[k] in segs_of), None)
             a_, la_, b_, lb_ = e
             w = classes.width(net)
             pitch = w + need(net, nb) if nb else 0.0
             path = follow(net, a_, b_, la_, lb_, w, segs_of.get(nb), pitch,
                           reserve=math.ceil((len(bus["nets"]) - 1) / 2) * pitch_all, soft=ns.through)
+            if not path and segs_of and len(bus["nets"]) - len(skipped_nets) > 2:
+                # an outer net that does not fit is left to the autorouter; the rest stays a bundle
+                say(f"bus {bus['from']}->{bus['to']}: {net} does not fit, left out of the bundle")
+                skipped_nets.append(net)
+                continue
             if not path:
                 say(f"bus {bus['from']}->{bus['to']}: {net} does not fit, bus left to the autorouter")
                 laid = None if not laid else laid + [None]
@@ -1143,7 +1213,7 @@ def route_buses(bus_data):
             segs_of[net] = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x),
                              TO(o.GetEnd().y)) for o in new if o.GetClass() == "PCB_TRACK"]
         if laid and None not in laid:
-            for n in bus["nets"]:
+            for n in [n for n in bus["nets"] if n not in skipped_nets]:
                 sets = joined.setdefault(n, [])
                 ga, gb = group(n, bus["from"]), group(n, bus["to"])
                 sets[:] = [s_ for s_ in sets if s_ is not ga and s_ is not gb] + [ga | gb]
@@ -1168,7 +1238,7 @@ def route_buses(bus_data):
                                         [p for ref, p in pads_of.get(net_, []) if ref not in bus_ends.get(net_, ())])
             for o in laid:
                 o.SetLocked(not ns.unlocked)
-            report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets'])} nets")
+            report_lines.append(f"{bus['from']}->{bus['to']} {len(bus['nets']) - len(skipped_nets)} nets")
         else:   # the bus goes again; whatever it had taken out comes back
             rollback(mark)
     return report_lines

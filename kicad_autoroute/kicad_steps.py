@@ -3,7 +3,7 @@
   <kicad-python> kicad_steps.py strip  board.kicad_pcb [--keep-locked] [--zones]
   <kicad-python> kicad_steps.py unlock_new board.kicad_pcb reference.kicad_pcb
   <kicad-python> kicad_steps.py plane_nets board.kicad_pcb
-  <kicad-python> kicad_steps.py keep_fanout board.kicad_pcb routed_copy.kicad_pcb buses.json
+  <kicad-python> kicad_steps.py keep_fanout board.kicad_pcb routed_copy.kicad_pcb buses.json [--all]
   <kicad-python> kicad_steps.py apply  board.kicad_pcb placement.json
   <kicad-python> kicad_steps.py zones  board.kicad_pcb '[{"net": "GND", "layers": ["In1.Cu"]}]' [--inset 0.3]
   <kicad-python> kicad_steps.py export board.kicad_pcb out.dsn [--raw]
@@ -50,12 +50,14 @@ def strip(path, keep_locked=False, zones=False):
     print(f"strip: removed {gone} tracks/vias")
 
 
-def keep_fanout(path, fanout_board, buses_json, reach=3.0):
+def keep_fanout(path, fanout_board, buses_json, reach=3.0, all_nets=False):
     """Copies the autorouter's fan-out of the bus nets (a short way from a fine-pitch pin to a via)
     from a routed copy onto the board, locked: buses are then laid to those vias, the way people
     fan a fine-pitch part out first and run the bus to its vias."""
     nets = {n for bus in json.load(open(buses_json, encoding="utf-8")).get("detail", []) for n in bus["nets"]}
     src = pcbnew.LoadBoard(fanout_board)
+    if all_nets:   # every fine-pitch pin keeps its way out, so the bundles cannot wall any pin in
+        nets = {p.GetNetname() for f in src.GetFootprints() for p in f.Pads() if p.GetNetname()}
     dst = pcbnew.LoadBoard(path)
     fine = {}
     for f in src.GetFootprints():
@@ -360,7 +362,7 @@ if __name__ == "__main__":
     if cmd == "strip":
         strip(args[0], "--keep-locked" in args, "--zones" in args)
     elif cmd == "keep_fanout":
-        keep_fanout(args[0], args[1], args[2])
+        keep_fanout(args[0], args[1], args[2], all_nets="--all" in args)
     elif cmd == "plane_nets":
         plane_nets(args[0])
     elif cmd == "unlock_new":

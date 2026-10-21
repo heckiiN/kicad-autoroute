@@ -235,7 +235,7 @@ def select_best(results: list[dict]) -> dict:
     return min(fair, key=lambda r: (-round(r.get("parallel", 0.0), 1), r.get("off_share", 0.0), r["vias"], r["track_mm"]))
 
 
-def pick_candidates(scored: list[dict], n: int) -> list[dict]:
+def pick_candidates(scored: list[dict], n: int, bus_reach: int = 0) -> list[dict]:
     """The best routed result of every routing variant (both layers, single layer), then the next best
     overall up to n: a single-layer result usually leaves more open before finishing but often ends
     up cleaner after it."""
@@ -247,7 +247,7 @@ def pick_candidates(scored: list[dict], n: int) -> list[dict]:
     for r in ranked:
         stem = Path(r["ses"]).stem
         variant = next((t for t in ("_1L", "_main", "_rebus", "_bus") if stem.endswith(t)), "")
-        if r["unconnected"] > reach:
+        if r["unconnected"] > reach + (bus_reach if variant == "_bus" else 0):
             continue
         if variant not in variants:
             variants.add(variant)
@@ -388,11 +388,13 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
                 if fan.ses and Path(fan.ses).exists():
                     fan_board = copy_project(pre, work / "fanout_board", name)
                     steps("import", fan_board, Path(fan.ses).resolve(), fan_board)
-                    log(steps("keep_fanout", bus_pre, fan_board, buses_json))
+                    log(steps("keep_fanout", bus_pre, fan_board, buses_json, *(["--all"] if bus_cfg.get("fanout_all", True) else [])))
             # long buses need a larger search budget than single connections; a coarser grid keeps it fast
             log(kpy(HERE / "lastmile.py", bus_pre, buses_json, "--buses", "--min-width", min_track_width(pro, dru),
                     "--max-cells", 200000, "--max-expansions", 1500000, "--time-budget", 1500,
                     "--trim-fanout", bus_cfg.get("trim_fanout", 0.0 if bus_cfg.get("fanout_first", False) else 1.5),
+                    "--demand", bus_cfg.get("demand", 0.1),
+                    "--fan-radius", bus_cfg.get("fan_radius", 1.5),
                     *([] if bus_cfg.get("lock", True) else ["--unlocked"]),
                     timeout=1800, fatal=False))
             dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
@@ -497,7 +499,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     # 9: finish the best candidates (last mile, clean-up, silkscreen), keep the best finished board
     finish_cfg = cfg.get("finish", {})
     finished = []
-    for cand in pick_candidates(scored, finish_cfg.get("candidates", 2)):
+    for cand in pick_candidates(scored, finish_cfg.get("candidates", 2), finish_cfg.get("bus_reach", 0)):
         pcb = Path(cand["board"])
         notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False),
                        buses_json=buses_json, unlock_against=src)
