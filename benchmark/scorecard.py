@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from kicad_autoroute import pipeline  # noqa: E402
-from benchmark.run_benchmark import BOARDS, demos_dir  # noqa: E402
+from benchmark.run_benchmark import ALL_BOARDS, demos_dir  # noqa: E402
 
 
 def measure(board: Path) -> dict:
@@ -40,7 +40,7 @@ def main() -> int:
         finals = sorted((run / name / "pipeline" / "result").glob("*.kicad_pcb"))
         if not finals:
             continue
-        human, ai = measure(demos / BOARDS[name]), measure(finals[0])
+        human, ai = measure(demos / ALL_BOARDS[name]), measure(finals[0])
         p = row["pipeline"]
         checks = {"complete": p["unconnected"] == 0 and p["error_count"] == 0,
                   "vias": ai["vias"] <= 1.1 * human["vias"] + 2}

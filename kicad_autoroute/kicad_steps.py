@@ -212,7 +212,34 @@ def export(path, dsn, raw=False):
     rooms = [z for z in b.Zones() if z.GetIsRuleArea() and not z.GetDoNotAllowTracks() and not z.GetDoNotAllowVias()]
     for z in rooms:
         b.Remove(z)
-    print("export:", pcbnew.ExportSpecctraDSN(b, dsn), f"({len(rooms)} rule areas without track/via keepout left out)")
+    # solder mask openings drawn as graphics with no pad in them (logos, bare copper areas): a track
+    # under one would be exposed, so the router gets them as keepouts on the copper layer below
+    openings = 0
+    art = list(b.GetDrawings()) + [g for f in b.GetFootprints() for g in f.GraphicalItems()]
+    pads = [p for f in b.GetFootprints() for p in f.Pads()]
+    for d in art:
+        cu = {pcbnew.F_Mask: pcbnew.F_Cu, pcbnew.B_Mask: pcbnew.B_Cu}.get(d.GetLayer())
+        if cu is None or d.GetClass() == "PCB_TEXT":
+            continue
+        bb = d.GetBoundingBox()
+        if any(p.IsOnLayer(cu) and bb.Contains(p.GetPosition()) for p in pads):
+            continue
+        z = pcbnew.ZONE(b)
+        z.SetIsRuleArea(True)
+        z.SetDoNotAllowTracks(True)
+        z.SetDoNotAllowVias(True)
+        z.SetDoNotAllowPads(False)
+        z.SetDoNotAllowFootprints(False)
+        z.SetLayer(cu)
+        outline = z.Outline()
+        outline.NewOutline()
+        for x, y in ((bb.GetLeft(), bb.GetTop()), (bb.GetRight(), bb.GetTop()), (bb.GetRight(), bb.GetBottom()),
+                     (bb.GetLeft(), bb.GetBottom())):
+            outline.Append(x, y)
+        b.Add(z)
+        openings += 1
+    print("export:", pcbnew.ExportSpecctraDSN(b, dsn), f"({len(rooms)} rule areas without track/via keepout left out, "
+          f"{openings} solder mask openings as keepouts)")
     import dsn_fix
     for line in dsn_fix.fix(dsn, path):
         print("dsn_fix:", line)
@@ -300,7 +327,7 @@ def drop_offenders(path, report_path):
     last-mile router then reconnects legally."""
     report = json.load(open(report_path, encoding="utf-8"))
     kinds = {"clearance", "copper_edge_clearance", "hole_clearance", "hole_to_hole", "tracks_crossing",
-             "shorting_items"}
+             "shorting_items", "solder_mask_bridge"}
     ids = {i["uuid"] for v in report.get("violations", []) if v.get("severity") == "error"
            and v.get("type") in kinds for i in v.get("items", [])}
     b = pcbnew.LoadBoard(path)

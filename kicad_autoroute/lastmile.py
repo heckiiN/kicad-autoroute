@@ -109,11 +109,26 @@ for t in b.GetTracks():
 # nets with a pour stay: they may tie the net to the pour.
 poured = {z.GetNetname() for z in b.Zones() if not z.GetIsRuleArea()}
 items = []
+def pad_shape(p):
+    """A pad as an obstacle: its own rectangle, turned with the pad ("rbox"), so a part placed at an
+    angle (a QFP at 45 degrees) does not grow into its neighbours' bounding boxes; round pads as discs."""
+    c = p.GetPosition()
+    sx, sy = TO(p.GetSize().x) / 2, TO(p.GetSize().y) / 2
+    if p.GetShape() == pcbnew.PAD_SHAPE_CIRCLE:
+        return "disc", (TO(c.x), TO(c.y), sx)
+    if p.GetShape() == pcbnew.PAD_SHAPE_CUSTOM:
+        bb = p.GetBoundingBox()
+        return "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom()))
+    a = p.GetOrientation().AsRadians()
+    # KiCad's y axis points down; the pad's local x axis is turned by -a in board coordinates
+    return "rbox", (TO(c.x), TO(c.y), sx, sy, math.cos(a), -math.sin(a))
+
+
 for f in b.GetFootprints():
     for p in f.Pads():
-        bb = p.GetBoundingBox()
         pl = [l for l in layers if p.IsOnLayer(l)]
-        items.append((p.GetNetname(), pl, "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
+        kind, geo = pad_shape(p)
+        items.append((p.GetNetname(), pl, kind, geo, None))
 # copper text and graphics (board level and inside footprints) are fixed copper without a net
 copper_art = list(b.GetDrawings())
 for f in b.GetFootprints():
@@ -125,6 +140,21 @@ for d in copper_art:
         bb = d.GetBoundingBox()
         net = d.GetNetname() if hasattr(d, "GetNetname") else ""
         items.append((net, [d.GetLayer()], "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
+# solder mask openings drawn as graphics (exposed copper areas, logos): a track of another net
+# under one would be bare next to it (solder mask bridge), so they block the copper layer below;
+# an opening around pads of a single net lets that net through
+for d in copper_art:
+    mask_to_cu = {pcbnew.F_Mask: pcbnew.F_Cu, pcbnew.B_Mask: pcbnew.B_Cu}
+    if d.GetClass() in ("PCB_FIELD", "PCB_TEXT") or d.GetLayer() not in mask_to_cu:
+        continue
+    cu = mask_to_cu[d.GetLayer()]
+    if cu not in layers:
+        continue
+    bb = d.GetBoundingBox()
+    box = (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom()))
+    inside = {p.GetNetname() for f in b.GetFootprints() for p in f.Pads() if p.IsOnLayer(cu)
+              and box[0] <= TO(p.GetPosition().x) <= box[2] and box[1] <= TO(p.GetPosition().y) <= box[3]}
+    items.append((inside.pop() if len(inside) == 1 else "", [cu], "box", box, None))
 for t in b.GetTracks():
     if t.GetClass() == "PCB_VIA":
         r = TO(t.GetWidth(pcbnew.F_Cu)) / 2
@@ -158,6 +188,10 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all", grid_margin=0.75):
         elif kind == "disc":
             cx, cy, r = geo
             lo_x, lo_y, hi_x, hi_y = cx - r - m, cy - r - m, cx + r + m, cy + r + m
+        elif kind == "rbox":
+            cx, cy, hx, hy, ca, sa = geo
+            rr = math.hypot(hx, hy) + m
+            lo_x, lo_y, hi_x, hi_y = cx - rr, cy - rr, cx + rr, cy + rr
         else:
             sx, sy, ex, ey, hw = geo
             lo_x, lo_y = min(sx, ex) - hw - m, min(sy, ey) - hw - m
@@ -173,6 +207,10 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all", grid_margin=0.75):
             hit = d < m
         elif kind == "disc":
             hit = np.hypot(Xs - cx, Ys - cy) < r + m
+        elif kind == "rbox":
+            u = (Xs - cx) * ca + (Ys - cy) * sa
+            v = -(Xs - cx) * sa + (Ys - cy) * ca
+            hit = np.hypot(np.maximum(np.abs(u) - hx, 0), np.maximum(np.abs(v) - hy, 0)) < m
         else:
             dx, dy = ex - sx, ey - sy
             L = dx * dx + dy * dy

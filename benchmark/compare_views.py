@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from kicad_autoroute import pipeline, tools  # noqa: E402
-from benchmark.run_benchmark import BOARDS, demos_dir  # noqa: E402
+from benchmark.run_benchmark import ALL_BOARDS, demos_dir  # noqa: E402
 
 LAYERS = "B.Cu,F.Cu,Edge.Cuts"
 
@@ -48,7 +48,7 @@ def main() -> int:
         pipe = row.get("pipeline") or {}
         finals = sorted((run / name / "pipeline" / "result").glob("*.kicad_pcb"))
         final = finals[0] if finals else Path(pipe.get("board", ""))
-        human = demos / BOARDS[name]
+        human = demos / ALL_BOARDS[name]
         metrics, uri = {}, {}
         for tag, board in (("human", human), ("ai", final)):
             svg = export_svg(board, img / f"{name}_{tag}.svg")

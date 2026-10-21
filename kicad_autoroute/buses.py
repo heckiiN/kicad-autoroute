@@ -82,6 +82,39 @@ def find_buses(b, min_nets: int = 3) -> list[dict]:
     return buses
 
 
+PAIR_ENDINGS = (("+", "-"), ("P", "N"), ("_P", "_N"), ("DP", "DM"), ("DP", "DN"))
+
+
+def find_pairs(b, max_gap: float = 2.0) -> list[dict]:
+    """Differential pairs: two nets whose names differ only in the ending (+/-, P/N), each joining
+    the same two footprints from neighbouring pins (at most max_gap mm apart on both sides)."""
+    pads: dict[str, list] = {}
+    for f in b.GetFootprints():
+        for p in f.Pads():
+            if p.GetNetname():
+                pads.setdefault(p.GetNetname(), []).append((f.GetReference(), TO(p.GetPosition().x), TO(p.GetPosition().y)))
+    pairs, seen = [], set()
+    for net in pads:
+        for pos, neg in PAIR_ENDINGS:
+            if not net.upper().endswith(pos.upper()):
+                continue
+            stem = net[: len(net) - len(pos)]
+            other = next((n for n in pads if n != net and n.upper() == (stem + neg).upper()), None)
+            if other is None or (other, net) in seen or not 2 <= len(pads[net]) <= 4:
+                continue
+            seen.add((net, other))
+            refs = {r for r, _x, _y in pads[net]} & {r for r, _x, _y in pads[other]}
+            refs = sorted(refs)
+            for i, ra in enumerate(refs):
+                for rb in refs[i + 1:]:
+                    pa = [next(q for q in pads[n] if q[0] == ra) for n in (net, other)]
+                    pb = [next(q for q in pads[n] if q[0] == rb) for n in (net, other)]
+                    if all(math.hypot(x[0][1] - x[1][1], x[0][2] - x[1][2]) <= max_gap for x in (pa, pb)):
+                        pairs.append({"from": ra, "to": rb, "nets": [net, other], "pitch": 0.0, "pair": True})
+            break
+    return pairs
+
+
 def _seg_dist(px, py, s):
     sx, sy, ex, ey = s
     dx, dy = ex - sx, ey - sy
@@ -132,9 +165,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("board")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--pairs", action="store_true", help="also list differential pairs (to lay them as 2-net bundles)")
     ns = ap.parse_args()
     b = pcbnew.LoadBoard(ns.board)
     buses = find_buses(b)
+    if ns.pairs:
+        taken = {n for bus in buses for n in bus["nets"]}
+        buses += [p for p in find_pairs(b) if not set(p["nets"]) & taken]
     weighted = length = 0.0
     for bus in buses:
         share, total = parallelism(b, bus)

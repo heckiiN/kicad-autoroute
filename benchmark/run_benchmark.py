@@ -31,6 +31,18 @@ BOARDS = {
     "multichannel": "multichannel/multichannel_mixer.kicad_pcb",
     "coldfire": "kit-dev-coldfire-xilinx_5213/kit-dev-coldfire-xilinx_5213.kicad_pcb",
 }
+# Held out: demo boards no setting was ever tuned on; run with --holdout to check that the pipeline
+# is not just fitted to the boards above. (vme-wren and jetson are too large for a routine run; the
+# microwave and NFC antenna demos are RF structures, not routing jobs.)
+HOLDOUT = {
+    "stickhub": "stickhub/StickHub.kicad_pcb",
+    "complex_hierarchy": "complex_hierarchy/complex_hierarchy.kicad_pcb",
+    "video": "video/video.kicad_pcb",
+    "one_air_max": "openair-max/One-Air-Max.kicad_pcb",
+    "cm5_minima": "cm5_minima/CM5_MINIMA_3.kicad_pcb",
+    "feather": "royalblue54L_feather/RoyalBlue54L-Feather.kicad_pcb",
+}
+ALL_BOARDS = {**BOARDS, **HOLDOUT}
 
 
 def demos_dir() -> Path:
@@ -77,7 +89,8 @@ def cell(r: dict | None) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--boards", nargs="*", choices=sorted(BOARDS), help="subset of boards")
+    ap.add_argument("--boards", nargs="*", choices=sorted(ALL_BOARDS), help="subset of boards")
+    ap.add_argument("--holdout", action="store_true", help="the held-out boards instead of the tuning set")
     ap.add_argument("--demos", type=Path, help="KiCad demos directory (default: found from the KiCad install)")
     ap.add_argument("--standard", type=Path, metavar="JAR", help="also run the plugin workflow with this stock jar")
     ap.add_argument("--standard-timeout", type=int, default=3600, help="seconds for a standard run")
@@ -91,8 +104,8 @@ def main() -> int:
     out = ns.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     rows = {}
-    for name in ns.boards or BOARDS:
-        board = demos / BOARDS[name]
+    for name in ns.boards or (HOLDOUT if ns.holdout else BOARDS):
+        board = demos / ALL_BOARDS[name]
         print(f"=== {name}: {board}", flush=True)
         row = rows[name] = {}
         if ns.standard:

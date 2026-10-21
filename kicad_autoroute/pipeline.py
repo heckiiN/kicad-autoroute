@@ -375,7 +375,7 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     # copy of the board before Freerouting routes the rest; a routing variant like the layer styles
     bus_pre, dsn_bus, buses_json = None, None, work / "route" / "buses.json"
     if cfg.get("buses", {}).get("enabled", True):
-        found = json.loads(kpy(HERE / "buses.py", pre, "--json").splitlines()[-1])
+        found = json.loads(kpy(HERE / "buses.py", pre, "--json", "--pairs").splitlines()[-1])
         if found["buses"]:
             buses_json.write_text(json.dumps(found), encoding="utf-8")
             bus_pre = copy_project(pre, work / "board_bus", name)
