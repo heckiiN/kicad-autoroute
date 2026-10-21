@@ -69,7 +69,7 @@ board's own limits) are counted apart.
 | One-Air-Max | 2 / 210 | 0 / 226 | **3 / 27** | 0 | 68 min |
 | RoyalBlue54L-Feather | 6 / 71 | 0 / 237 | **11–14 / 51** | 0 | 75–80 min |
 | video | 4 / 189 | 0 / 0 | **187 / 0** | 0 | 1.7 h |
-| private board (handheld, 4 / 158) | | 0 / 0 | **0–1 / 0** | 0 | 30–55 min |
+| private board | 4 / 158 | 0 / 0 | **0–1 / 0** | 0 | 30–55 min |
 
 The held-out boards found real faults that the tuning boards never showed, all fixed in general
 form: pads of parts turned by 45° modelled as their bounding box, solder-mask openings drawn as
