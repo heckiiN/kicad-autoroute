@@ -204,3 +204,34 @@ def board_edges(b) -> tuple[list[tuple[float, float, float, float]], float]:
             pts = [(pcbnew.ToMM(ch.CPoint(k).x), pcbnew.ToMM(ch.CPoint(k).y)) for k in range(ch.PointCount())]
             segs += [(x1, y1, x2, y2) for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1])]
     return segs, pcbnew.ToMM(b.GetDesignSettings().m_CopperEdgeClearance)
+
+
+def keepouts(b) -> list[tuple[tuple, set, bool, bool]]:
+    """Keep-out rule areas of the board and its footprints: (polygon points in mm, copper layer ids,
+    tracks not allowed, vias not allowed)."""
+    import pcbnew
+    out = []
+    for z in list(b.Zones()) + [z for f in b.GetFootprints() for z in f.Zones()]:
+        if not z.GetIsRuleArea() or not (z.GetDoNotAllowTracks() or z.GetDoNotAllowVias()):
+            continue
+        lays = {l for l in z.GetLayerSet().Seq() if pcbnew.IsCopperLayer(l)}
+        poly = z.Outline()
+        for i in range(poly.OutlineCount()):
+            ch = poly.COutline(i)
+            pts = tuple((pcbnew.ToMM(ch.CPoint(k).x), pcbnew.ToMM(ch.CPoint(k).y)) for k in range(ch.PointCount()))
+            if len(pts) >= 3:
+                out.append((pts, lays, z.GetDoNotAllowTracks(), z.GetDoNotAllowVias()))
+    return out
+
+
+def poly_dist(x: float, y: float, pts: tuple) -> float:
+    """Distance from a point to a polygon, 0 inside."""
+    inside, best = False, float("inf")
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
+            inside = not inside
+        dx, dy = x2 - x1, y2 - y1
+        L = dx * dx + dy * dy
+        t = 0.0 if L == 0 else max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / L))
+        best = min(best, ((x - x1 - t * dx) ** 2 + (y - y1 - t * dy) ** 2) ** 0.5)
+    return 0.0 if inside else best

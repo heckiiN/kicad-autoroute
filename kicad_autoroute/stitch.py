@@ -24,7 +24,7 @@ import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kicad_classes import NetClasses, ViaRules, board_edges  # noqa: E402
+from kicad_classes import NetClasses, ViaRules, board_edges, keepouts, poly_dist  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("board")
@@ -75,6 +75,7 @@ def need(other_net, base):
 pads, tracks, vias = [], [], []
 # the board outline (notches and cut-outs inside its bounding box): vias and links keep the edge clearance
 edge_segs, edge_clr = board_edges(b)
+rule_areas = keepouts(b)
 for f in b.GetFootprints():
     for p in f.Pads():
         bb = p.GetBoundingBox()
@@ -139,6 +140,10 @@ def ok(cx, cy, own_pad, link_from, tw, base_clr, vd, layer):
         if seg_dist(cx, cy, x1, y1, x2, y2) < r + edge_clr or any(
                 seg_dist(px, py, x1, y1, x2, y2) < tw / 2 + edge_clr for px, py in link):
             return False
+    for pts, lays, no_tracks, no_vias in rule_areas:
+        if (no_vias and poly_dist(cx, cy, pts) < r + base_clr) or (no_tracks and layer in lays and any(
+                poly_dist(px, py, pts) < tw / 2 + base_clr for px, py in link)):
+            return False
     return True
 
 
@@ -162,6 +167,9 @@ def link_ok(a, c, tw, layer, skip_pads):
             return False
     for x1, y1, x2, y2 in edge_segs:
         if any(seg_dist(px, py, x1, y1, x2, y2) < tw / 2 + edge_clr for px, py in link):
+            return False
+    for pts, lays, no_tracks, _no_vias in rule_areas:
+        if no_tracks and layer in lays and any(poly_dist(px, py, pts) < tw / 2 + own_clear for px, py in link):
             return False
     return True
 

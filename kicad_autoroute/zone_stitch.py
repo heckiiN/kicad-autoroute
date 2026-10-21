@@ -17,7 +17,7 @@ import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kicad_classes import NetClasses, ViaRules, board_edges  # noqa: E402
+from kicad_classes import NetClasses, ViaRules, board_edges, keepouts, poly_dist  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("board")
@@ -69,6 +69,10 @@ for d in copper_art:
     if pcbnew.IsCopperLayer(d.GetLayer()) and (not hasattr(d, "GetNetname") or d.GetNetname() != ns.net):
         bb = d.GetBoundingBox()
         obst.append(("box", "", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
+# keep-out rule areas where vias are not allowed
+for pts, _lays, _no_tracks, no_vias in keepouts(b):
+    if no_vias:
+        obst.append(("poly", "", pts, None))
 # the board outline (notches and cut-outs inside its bounding box) keeps the edge clearance
 edge_segs, edge_clr = board_edges(b)
 for x1, y1, x2, y2 in edge_segs:
@@ -102,6 +106,8 @@ def conflicts(x, y, ignore_unlocked):
             d = math.hypot(max(g[0] - x, 0, x - g[2]), max(g[1] - y, 0, y - g[3]))
         elif kind == "disc":
             d = math.hypot(x - g[0], y - g[1]) - g[2]
+        elif kind == "poly":
+            d = poly_dist(x, y, g)
         else:
             sx, sy, ex, ey, hw = g
             dx, dy = ex - sx, ey - sy
@@ -128,6 +134,8 @@ def free(x, y):
             d = math.hypot(max(g[0] - x, 0, x - g[2]), max(g[1] - y, 0, y - g[3]))
         elif kind == "disc":
             d = math.hypot(x - g[0], y - g[1]) - g[2]
+        elif kind == "poly":
+            d = poly_dist(x, y, g)
         else:
             sx, sy, ex, ey, hw = g
             dx, dy = ex - sx, ey - sy

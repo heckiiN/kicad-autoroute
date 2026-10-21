@@ -160,6 +160,38 @@ for d in copper_art:
 edge_segs, edge_clr = board_edges(b)
 for x1, y1, x2, y2 in edge_segs:
     items.append(("", layers, "seg", (x1, y1, x2, y2, max(0.0, edge_clr - classes.clearance(""))), None))
+# keep-out rule areas (board level and inside footprints): no track where tracks are not allowed;
+# where only vias are not allowed, the via map gets them (VIA_KEEPOUTS)
+VIA_KEEPOUTS = []
+for z in list(b.Zones()) + [z for f in b.GetFootprints() for z in f.Zones()]:
+    if not z.GetIsRuleArea() or not (z.GetDoNotAllowTracks() or z.GetDoNotAllowVias()):
+        continue
+    outline = z.Outline()
+    for oi in range(outline.OutlineCount()):
+        ch = outline.COutline(oi)
+        pts = tuple((TO(ch.CPoint(k).x), TO(ch.CPoint(k).y)) for k in range(ch.PointCount()))
+        if len(pts) < 3:
+            continue
+        if z.GetDoNotAllowTracks():
+            items.append(("", [l for l in layers if z.IsOnLayer(l)], "poly", pts, None))
+        else:
+            VIA_KEEPOUTS.append(pts)
+
+
+def poly_hit(Xs, Ys, pts, m):
+    """Grid cells inside the polygon or closer than m to its border."""
+    inside = np.zeros(Xs.shape, bool)
+    near = np.zeros(Xs.shape, bool)
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
+        if y1 != y2:
+            inside ^= ((y1 > Ys) != (y2 > Ys)) & (Xs < (x2 - x1) * (Ys - y1) / (y2 - y1) + x1)
+        dx, dy = x2 - x1, y2 - y1
+        L = dx * dx + dy * dy
+        t = np.clip(((Xs - x1) * dx + (Ys - y1) * dy) / L, 0, 1) if L > 0 else 0
+        near |= np.hypot(Xs - (x1 + t * dx), Ys - (y1 + t * dy)) < m
+    return inside | near
+
+
 # solder mask openings drawn as graphics (exposed copper areas, logos): a track of another net
 # under one would be bare next to it (solder mask bridge), so they block the copper layer below;
 # an opening around pads of a single net lets that net through
@@ -212,6 +244,9 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all", grid_margin=0.75):
             cx, cy, hx, hy, ca, sa = geo
             rr = math.hypot(hx, hy) + m
             lo_x, lo_y, hi_x, hi_y = cx - rr, cy - rr, cx + rr, cy + rr
+        elif kind == "poly":
+            lo_x, lo_y = min(q[0] for q in geo) - m, min(q[1] for q in geo) - m
+            hi_x, hi_y = max(q[0] for q in geo) + m, max(q[1] for q in geo) + m
         else:
             sx, sy, ex, ey, hw = geo
             lo_x, lo_y = min(sx, ex) - hw - m, min(sy, ey) - hw - m
@@ -231,6 +266,8 @@ def blocked_map(net, x0, y0, nx, ny, g, half_w, which="all", grid_margin=0.75):
             u = (Xs - cx) * ca + (Ys - cy) * sa
             v = -(Xs - cx) * sa + (Ys - cy) * ca
             hit = np.hypot(np.maximum(np.abs(u) - hx, 0), np.maximum(np.abs(v) - hy, 0)) < m
+        elif kind == "poly":
+            hit = poly_hit(Xs, Ys, geo, m)
         else:
             dx, dy = ex - sx, ey - sy
             L = dx * dx + dy * dy
@@ -398,6 +435,8 @@ def route(net, a, b_pt, la, lb, width, goal_radius=0.0, deadline=float("inf"), s
     vr = ns.via[0] / 2
     vmaps = blocked_map(net, x0, y0, nx, ny, g, vr)
     via_ok = ~np.any(np.stack([vmaps[l] for l in layers]), axis=0)
+    for pts in VIA_KEEPOUTS:
+        via_ok &= ~poly_hit(X, Y, pts, vr + classes.clearance(net))
     for hx, hy, hr in holes:
         reach = hr + ns.via[1] / 2 + ns.hole_clearance
         i0, i1 = max(0, int((hx - reach - x0) / g)), min(nx, int((hx + reach - x0) / g) + 2)
