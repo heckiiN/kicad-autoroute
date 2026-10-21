@@ -36,11 +36,11 @@ Cells: unconnected / DRC errors, counted by KiCad's DRC after refilling zones.
 | pic_programmer | 2 / 63 | 0 / 0 | 2 / 2 | **0 / 0** | 5 min |
 | interf_u | 2 / 25 | 0 / 2 | 13 / 5 | **0 / 0** | 11 min |
 | multichannel_mixer | 2 / 114 | 0 / 12 | 160 / 42 | **0 / 0** | 6 min |
-| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **3 / 0**² | 62 min |
+| kit-dev-coldfire | 4 / 160 | 0 / 0 | 41 / 130 | **0–2 / 0**² | 85 min |
 | private board (HV rules) | 4 / 491 | 0 / 0 | no result in 1 h | **83 / 2**³ | 2.6 h |
 
 ¹ Tracks removed, KiCad's Specctra export, Freerouting 2.4.1 with up to 100 passes, session imported back.
-² Results vary between runs (Freerouting's passes depend on timing); recent runs left 1–4 open.
+² Results vary between runs (Freerouting's passes depend on timing); recent runs left 0–2 open.
 ³ An earlier version; the remaining errors were "starved thermal" reliefs on the ground pour.
 
 ### Does it look hand-made?
@@ -50,8 +50,34 @@ hand-routed original: complete (0 open, 0 errors), at most 1.1 × the human's vi
 neighbouring pins between two parts) at least as bundled as the human laid them (share of bus length
 running alongside its neighbour, human − 0.05), and on 2-layer boards as much copper on the main side
 (human − 0.10). Five of six demo boards pass all four. kit-dev-coldfire does not yet: its vias are
-within the human's range now (253–284 against 253), but 2–4 connections stay open and its buses are
-0.37–0.48 bundled against the human's 0.80.
+at the human's count now (241–256 against 253), but 0–2 connections stay open depending on the run,
+and its buses are 0.24–0.33 bundled against the human's 0.80.
+
+### Boards it was never tuned on
+
+The six boards above are the ones the router was developed against, so they can hide overfitting.
+`run_benchmark.py --holdout` runs six other KiCad demo boards, used only to check changes, never to
+tune them; a private board of the author is in the same role. Errors that the hand-routed original
+has as well (footprints closer than their courtyards, pads too near the edge, drills outside the
+board's own limits) are counted apart.
+
+| Board | Layers / parts | Original | **kicad-autoroute** | own errors | Time |
+|---|---|---|---|---|---|
+| complex_hierarchy | 2 / 68 | 0 / 0 | **0 / 0** | 0 | 4 min |
+| StickHub | 2 / 94 | 0 / 0 | **0–1 / 0** | 0 | 6–13 min |
+| CM5_MINIMA_3 | 4 / 112 | 0 / 2 | **1 / 2** | 0 | 60 min |
+| One-Air-Max | 2 / 210 | 0 / 226 | **3 / 27** | 0 | 68 min |
+| RoyalBlue54L-Feather | 6 / 71 | 0 / 237 | **11–14 / 51** | 0 | 75–80 min |
+| video | 4 / 189 | 0 / 0 | **187 / 0** | 0 | 1.7 h |
+| private board (handheld, 4 / 158) | | 0 / 0 | **0–1 / 0** | 0 | 30–55 min |
+
+The held-out boards found real faults that the tuning boards never showed, all fixed in general
+form: pads of parts turned by 45° modelled as their bounding box, solder-mask openings drawn as
+graphics, pad-level clearances (1.7 mm around a module's mounting holes), the board outline checked
+by its bounding box only, keep-out areas ignored by the last-mile router, KiCad message boxes that
+block a headless run, a session import that hung on duplicate references, and legitimately thin
+0.127 mm differential pairs removed as "necked" tracks. Large dense boards (video) stay far from
+complete: Freerouting does not get past its first pass within the time limit there.
 
 Measured on Windows 10, KiCad 10.0, 4 seeds × 20 min, 16 cores. `tinytapeout-demo` is left out:
 KiCad's Python API does not load it within 15 minutes on this machine.
