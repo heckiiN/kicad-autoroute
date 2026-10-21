@@ -102,7 +102,15 @@ def min_track_width(pro: Path, dru: Path) -> float:
         import re
         for m in re.finditer(r"constraint\s+track_width\s+\(min\s+([\d.]+)\s*mm\)", dru.read_text(encoding="utf-8")):
             widths.append(float(m.group(1)))
-    return min(widths) if widths else 0.15
+    if widths:
+        return min(widths)
+    # no minimum set: the narrowest net class is legal by design (0.127 mm differential pairs), so
+    # the floor is not above it
+    try:
+        classes = json.load(open(pro, encoding="utf-8"))["net_settings"]["classes"]
+        return min([0.15] + [c["track_width"] for c in classes if c.get("track_width")])
+    except (OSError, KeyError, ValueError):
+        return 0.15
 
 
 def drc(pcb: Path) -> dict:
