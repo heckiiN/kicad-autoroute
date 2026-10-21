@@ -548,7 +548,9 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     def finish_one(cand: dict) -> dict:
         pcb = Path(cand["board"])
         notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False),
-                       buses_json=buses_json, unlock_against=src, time_limit=finish_cfg.get("time_limit", 2400))
+                       buses_json=buses_json, unlock_against=src,
+                       # the last mile's work grows with what is open: 40 min, more on large boards (2 h at most)
+                       time_limit=finish_cfg.get("time_limit") or min(7200, max(2400, 600 + 6 * cand["unconnected"])))
         r = drc(pcb)
         r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
         r["off_share"] = off_share(r, main_layer)

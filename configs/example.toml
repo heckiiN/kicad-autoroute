@@ -70,7 +70,8 @@ min_trace_width = true      # pass the board's minimum track width to the router
 
 [finish]
 candidates = 3          # best routed candidates that get the finishing pass (side by side)
-time_limit = 2400       # seconds of last-mile routing per candidate (large boards); clean-up always runs
+# time_limit = 2400     # seconds of last-mile routing per candidate; default 40 min, growing with the
+                        # open connections up to 2 h (large boards); the clean-up always runs
 workers = 3             # candidates finished side by side
 texts_from_original = false
 
