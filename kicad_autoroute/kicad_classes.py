@@ -186,3 +186,21 @@ class ViaRules:
             if v not in out:
                 out.append(v)
         return out
+
+
+def board_edges(b) -> tuple[list[tuple[float, float, float, float]], float]:
+    """The board outline as segments in mm (outer contour, cut-outs, arcs as KiCad flattens them)
+    and the copper-to-edge clearance of the board setup (run with KiCad's python, b a loaded board).
+    A notch or a rounded corner sits inside the outline's bounding box; copper must keep off it too."""
+    import pcbnew
+    poly = pcbnew.SHAPE_POLY_SET()
+    segs = []
+    if b.GetBoardPolygonOutlines(poly, True):
+        chains = []
+        for i in range(poly.OutlineCount()):
+            chains.append(poly.COutline(i))
+            chains += [poly.CHole(i, h) for h in range(poly.HoleCount(i))]
+        for ch in chains:
+            pts = [(pcbnew.ToMM(ch.CPoint(k).x), pcbnew.ToMM(ch.CPoint(k).y)) for k in range(ch.PointCount())]
+            segs += [(x1, y1, x2, y2) for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1])]
+    return segs, pcbnew.ToMM(b.GetDesignSettings().m_CopperEdgeClearance)

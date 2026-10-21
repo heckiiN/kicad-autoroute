@@ -25,7 +25,7 @@ import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kicad_classes import NetClasses, ViaRules  # noqa: E402
+from kicad_classes import NetClasses, ViaRules, board_edges  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("board")
@@ -125,10 +125,24 @@ def pad_shape(p):
     return "rbox", (TO(c.x), TO(c.y), sx, sy, math.cos(a), -math.sin(a))
 
 
+def grow(kind, geo, d):
+    """The shape d larger on every side."""
+    if kind == "disc":
+        return geo[:2] + (geo[2] + d,)
+    if kind == "box":
+        return (geo[0] - d, geo[1] - d, geo[2] + d, geo[3] + d)
+    return geo[:2] + (geo[2] + d, geo[3] + d) + geo[4:]
+
+
 for f in b.GetFootprints():
     for p in f.Pads():
         pl = [l for l in layers if p.IsOnLayer(l)]
         kind, geo = pad_shape(p)
+        # a clearance set on the pad or its part (1.7 mm around a mounting hole) above its net
+        # class: the shape grows by the difference
+        own_extra = TO(p.GetOwnClearance(pl[0] if pl else pcbnew.F_Cu)) - classes.clearance(p.GetNetname())
+        if own_extra > 1e-3:
+            geo = grow(kind, geo, own_extra)
         items.append((p.GetNetname(), pl, kind, geo, None))
 # copper text and graphics (board level and inside footprints) are fixed copper without a net
 copper_art = list(b.GetDrawings())
@@ -141,6 +155,11 @@ for d in copper_art:
         bb = d.GetBoundingBox()
         net = d.GetNetname() if hasattr(d, "GetNetname") else ""
         items.append((net, [d.GetLayer()], "box", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
+# the board outline itself (notches, cut-outs, rounded corners inside its bounding box): copper keeps
+# the board's edge clearance from it; the segment's half width carries what that exceeds the net clearance
+edge_segs, edge_clr = board_edges(b)
+for x1, y1, x2, y2 in edge_segs:
+    items.append(("", layers, "seg", (x1, y1, x2, y2, max(0.0, edge_clr - classes.clearance(""))), None))
 # solder mask openings drawn as graphics (exposed copper areas, logos): a track of another net
 # under one would be bare next to it (solder mask bridge), so they block the copper layer below;
 # an opening around pads of a single net lets that net through

@@ -24,7 +24,7 @@ import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kicad_classes import NetClasses, ViaRules  # noqa: E402
+from kicad_classes import NetClasses, ViaRules, board_edges  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("board")
@@ -73,10 +73,16 @@ def need(other_net, base):
 
 
 pads, tracks, vias = [], [], []
+# the board outline (notches and cut-outs inside its bounding box): vias and links keep the edge clearance
+edge_segs, edge_clr = board_edges(b)
 for f in b.GetFootprints():
     for p in f.Pads():
         bb = p.GetBoundingBox()
-        pads.append((p, p.GetNetname(), TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())))
+        # a clearance set on the pad or its part (1.7 mm around a mounting hole) above its net
+        # class: the pad's box grows by the difference
+        g = max(0.0, TO(p.GetOwnClearance(pcbnew.F_Cu)) - classes.clearance(p.GetNetname()))
+        pads.append((p, p.GetNetname(), TO(bb.GetLeft()) - g, TO(bb.GetTop()) - g, TO(bb.GetRight()) + g,
+                     TO(bb.GetBottom()) + g))
 for t in b.GetTracks():
     if t.GetClass() == "PCB_VIA":
         vias.append((t.GetNetname(), TO(t.GetPosition().x), TO(t.GetPosition().y), TO(t.GetWidth(pcbnew.F_Cu)) / 2))
@@ -129,6 +135,10 @@ def ok(cx, cy, own_pad, link_from, tw, base_clr, vd, layer):
         gap = 0.2 if net == cur_net else need(net, base_clr)
         if math.hypot(cx - vx, cy - vy) < r + vr + gap:
             return False
+    for x1, y1, x2, y2 in edge_segs:
+        if seg_dist(cx, cy, x1, y1, x2, y2) < r + edge_clr or any(
+                seg_dist(px, py, x1, y1, x2, y2) < tw / 2 + edge_clr for px, py in link):
+            return False
     return True
 
 
@@ -149,6 +159,9 @@ def link_ok(a, c, tw, layer, skip_pads):
             return False
     for net, vx, vy, vr in vias:
         if net != cur_net and any(math.hypot(px - vx, py - vy) < tw / 2 + vr + need(net, own_clear) for px, py in link):
+            return False
+    for x1, y1, x2, y2 in edge_segs:
+        if any(seg_dist(px, py, x1, y1, x2, y2) < tw / 2 + edge_clr for px, py in link):
             return False
     return True
 

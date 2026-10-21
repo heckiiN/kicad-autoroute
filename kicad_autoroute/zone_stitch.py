@@ -17,7 +17,7 @@ import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from kicad_classes import NetClasses, ViaRules  # noqa: E402
+from kicad_classes import NetClasses, ViaRules, board_edges  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("board")
@@ -55,7 +55,10 @@ for f in b.GetFootprints():
     for p in f.Pads():
         if p.GetNetname() != ns.net:
             bb = p.GetBoundingBox()
-            obst.append(("box", p.GetNetname(), (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
+            # a clearance set on the pad or its part above its net class: the box grows by the difference
+            g = max(0.0, TO(p.GetOwnClearance(pcbnew.F_Cu)) - classes.clearance(p.GetNetname()))
+            obst.append(("box", p.GetNetname(), (TO(bb.GetLeft()) - g, TO(bb.GetTop()) - g, TO(bb.GetRight()) + g,
+                                                 TO(bb.GetBottom()) + g), None))
 # copper text and graphics without a net (board level and inside footprints)
 copper_art = list(b.GetDrawings())
 for f in b.GetFootprints():
@@ -66,6 +69,10 @@ for d in copper_art:
     if pcbnew.IsCopperLayer(d.GetLayer()) and (not hasattr(d, "GetNetname") or d.GetNetname() != ns.net):
         bb = d.GetBoundingBox()
         obst.append(("box", "", (TO(bb.GetLeft()), TO(bb.GetTop()), TO(bb.GetRight()), TO(bb.GetBottom())), None))
+# the board outline (notches and cut-outs inside its bounding box) keeps the edge clearance
+edge_segs, edge_clr = board_edges(b)
+for x1, y1, x2, y2 in edge_segs:
+    obst.append(("seg", "", (x1, y1, x2, y2, max(0.0, edge_clr - classes.clearance(""))), None))
 holes = []
 rippable_holes = {}  # (x, y) -> uuid of an unlocked other-net via
 for t in b.GetTracks():
