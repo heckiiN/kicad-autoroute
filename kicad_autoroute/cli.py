@@ -22,7 +22,7 @@ DEFAULTS = {
     "escape": {"enabled": True},
     "stitch": {"enabled": "auto", "net": "GND"},
     "freerouting": {"seeds": 4, "workers": 4, "timeout": "00:20:00"},
-    "finish": {"candidates": 2},
+    "finish": {"candidates": 3},
     "report": {"renders": False},
 }
 

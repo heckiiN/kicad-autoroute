@@ -115,7 +115,12 @@ def main() -> int:
                                   workers=ns.workers, timeout=ns.timeout, plane_net=None, no_stitch=False,
                                   no_escape=False, strip_locked=False, renders=False)
         cfg, base, label = cli.build_config(args)
-        report = pipeline.run(cfg, base, label)
+        try:
+            report = pipeline.run(cfg, base, label)
+        except (Exception, SystemExit) as exc:   # one failing board must not end the whole benchmark
+            print(f"pipeline failed: {str(exc)[-500:]}", flush=True)
+            rows.pop(name)
+            continue
         row["reference"] = report["reference"]
         row["pipeline"] = dict(report["best"], time_s=report["timing_s"])
         print(f"pipeline: {cell(row['pipeline'])} in {report['timing_s']} s", flush=True)

@@ -69,7 +69,9 @@ min_trace_width = true      # pass the board's minimum track width to the router
 # args = ["--router.scoring.via_costs=60"]   # extra Freerouting settings
 
 [finish]
-candidates = 2          # best routed candidates that get the finishing pass
+candidates = 3          # best routed candidates that get the finishing pass (side by side)
+time_limit = 2400       # seconds of last-mile routing per candidate (large boards); clean-up always runs
+workers = 3             # candidates finished side by side
 texts_from_original = false
 
 [report]

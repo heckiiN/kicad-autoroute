@@ -26,6 +26,7 @@ export  writes the Specctra DSN for Freerouting and corrects it to the board's o
         left out. --raw writes KiCad's export unchanged.
 """
 import json
+from pathlib import Path
 import sys
 
 import pcbnew
@@ -245,10 +246,33 @@ def export(path, dsn, raw=False):
         print("dsn_fix:", line)
 
 
+def strip_placement(ses_text):
+    """The session without its component placement: the router never moves parts, and KiCad's
+    importer fails or hangs on a placement it cannot map back (parts with duplicate references such
+    as several "REF**" mounting holes, which the export renamed)."""
+    a = ses_text.find("(placement")
+    if a < 0:
+        return ses_text
+    depth = 0
+    for i in range(a, len(ses_text)):
+        if ses_text[i] == "(":
+            depth += 1
+        elif ses_text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return ses_text[:a] + "(placement (resolution um 10))" + ses_text[i + 1:]
+    return ses_text
+
+
 def import_ses(path, ses, out):
     b = pcbnew.LoadBoard(path)
-    if not pcbnew.ImportSpecctraSES(b, ses):
-        raise SystemExit("import failed")
+    plain = Path(out).with_suffix(".import.ses")
+    plain.write_text(strip_placement(Path(ses).read_text(encoding="utf-8")), encoding="utf-8")
+    try:
+        if not pcbnew.ImportSpecctraSES(b, str(plain)):
+            raise SystemExit("import failed")
+    finally:
+        plain.unlink(missing_ok=True)
     b.Save(out)
     print("import: ok")
 

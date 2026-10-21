@@ -763,14 +763,26 @@ def ripup(net, a, c, la, lc, width, goal_radius, deadline, depth=None):
             widths[entry[0]] = entry[3][4] * 2
     if len(by_net) > ns.max_rip_nets:
         return fail(f"{len(by_net)} nets in the way (limit {ns.max_rip_nets})")
+    # a ripped piece of a poured net (a stitching link, a stub to the pour) often need not come back:
+    # the pour may hold its pads together anyway; KiCad's count decides (taken with the new route in)
+    count_a = open_connections() if any(n_ in poured for n_ in by_net) else None
     for idx in victims:
         take_out(idx)
+    deferred = []
     for vnet, segs in by_net.items():
         ends = cut_ends(segs, via_pts.get(vnet, ()))
         if len(ends) < 2 or any(e[0] is None for e in ends) or vnet not in widths:
+            if vnet in poured and count_a is not None:
+                deferred.append(vnet)
+                continue
             return fail(f"ripped tracks of {vnet} leave {len(ends)} loose ends")
         if not rejoin(vnet, ends, widths[vnet], deadline, depth):
+            if vnet in poured and count_a is not None:
+                deferred.append(vnet)
+                continue
             return fail(f"{vnet} could not be routed again")
+    if deferred and open_connections() > count_a:
+        return fail(f"{', '.join(deferred)} not held together by the pour without the ripped tracks")
     for i, entry in pinned.items():   # rippable again for later connections
         if items[i] is not None:
             items[i] = entry
@@ -936,7 +948,9 @@ def reduce_vias(max_pads=8, via_cost_mm=12.0):
         length_before = sum(t.GetLength() for t in old if t.GetClass() != "PCB_VIA") / 1e6
         # take the net up (board and obstacle model)
         ids = {o.m_Uuid.AsString() for o in old}
-        removed_items = [(i, it) for i, it in enumerate(items) if it is not None and it[0] == net and it[2] in ("seg", "disc")]
+        # only the net's own tracks and vias leave the obstacle model; its pads (and locked copper) stay
+        removed_items = [(i, it) for i, it in enumerate(items) if it is not None and it[4] is not None
+                         and it[4].m_Uuid.AsString() in ids]
         for i, _it in removed_items:
             items[i] = None
         for o in old:
@@ -1199,16 +1213,32 @@ def route_buses(bus_data):
             for i, it in enumerate(items):
                 if it is not None and it[0] in bus["nets"] and it[4] is not None:
                     take_out(i)
-        if any(bus["to"] in group(n, bus["from"]) for n in bus["nets"]):
+        # nets whose two parts are already joined by other bundles (a net running to three parts) are
+        # not laid again, the rest of the bus is; those nets' bundle copper is the lane to run next to
+        todo = [n_ for n_ in bus["nets"] if bus["to"] not in group(n_, bus["from"])]
+        if not todo:
             say(f"bus {bus['from']}->{bus['to']}: its parts are already joined by other bundles")
             rollback(mark)
             continue
         n_items, n_holes = len(items), len(holes)
         segs_of, laid, pushed = {}, [], 0
+        for n_ in bus["nets"]:
+            if n_ not in todo:
+                own = [(it[1][0],) + tuple(it[3][:4]) for it in items if it is not None and it[0] == n_ and it[2] == "seg"]
+                if own:
+                    segs_of[n_] = own
+        if len(todo) < 2 and not segs_of:
+            say(f"bus {bus['from']}->{bus['to']}: its parts are already joined by other bundles")
+            rollback(mark)
+            continue
+        if len(todo) < len(bus["nets"]):
+            say(f"bus {bus['from']}->{bus['to']}: {len(bus['nets']) - len(todo)} nets already joined, laying {len(todo)}")
         pitch_all = bus_pitch(bus["nets"])
-        skipped_nets = []
+        skipped_nets = [n_ for n_ in bus["nets"] if n_ not in todo]
         order_ = bus["nets"]
         for net, nb in bundle_order(bus["nets"]):
+            if net not in todo:
+                continue
             e = ends(bus, net)
             if e is None:
                 laid = None
@@ -1224,7 +1254,7 @@ def route_buses(bus_data):
             pitch = w + need(net, nb) if nb else 0.0
             path = follow(net, a_, b_, la_, lb_, w, segs_of.get(nb), pitch,
                           reserve=math.ceil((len(bus["nets"]) - 1) / 2) * pitch_all, soft=ns.through)
-            if not path and segs_of and len(bus["nets"]) - len(skipped_nets) > 2:
+            if not path and laid and len(bus["nets"]) - len(skipped_nets) > 2:
                 # an outer net that does not fit is left to the autorouter; the rest stays a bundle
                 say(f"bus {bus['from']}->{bus['to']}: {net} does not fit, left out of the bundle")
                 skipped_nets.append(net)
@@ -1282,10 +1312,38 @@ def route_buses(bus_data):
     return report_lines
 
 
+def displace(created, net, keep_nets):
+    """Takes out the unlocked tracks and vias of other nets the new copper violates (a ripped via takes
+    the tracks of its net that end on it along). Returns {net: (segments, via points, width)} for
+    rejoin."""
+    victims = [i for i in victims_of(created, net) if items[i][0] not in keep_nets]
+    for idx in [i for i in victims if items[i][2] == "disc"]:
+        vnet, (vx, vy) = items[idx][0], items[idx][3][:2]
+        for j, other in enumerate(items):
+            if other is None or j in victims or other[0] != vnet or other[2] != "seg" or other[4] is None:
+                continue
+            sx, sy, ex, ey = other[3][:4]
+            if math.hypot(sx - vx, sy - vy) < 1e-3 or math.hypot(ex - vx, ey - vy) < 1e-3:
+                victims.append(j)
+    out = {}
+    for idx in victims:
+        entry = items[idx]
+        segs, vias, w = out.setdefault(entry[0], ([], [], None))
+        if entry[2] == "disc":
+            vias.append(tuple(entry[3][:2]))
+        else:
+            segs.append((entry[4].GetLayer(),) + tuple(entry[3][:4]))
+            out[entry[0]] = (segs, vias, entry[3][4] * 2)
+        take_out(idx)
+    return out
+
+
 def rebundle(bus_data):
-    """Clean-up for a routed board: every bus whose nets join just its two parts is taken up and
-    routed again as a bundle (each net in the lane next to the previous one). Kept only when the bus
-    runs clearly more parallel and no connection is lost; otherwise the old routes come back."""
+    """Clean-up for a routed board: buses that do not run as bundles are taken up and laid again as
+    bundles (each net in the lane next to the previous one). Buses over the same nets (a net that
+    runs to three parts) are laid together, each pair of parts once. A bundle may push tracks of other
+    nets aside; those are routed again (with rip-up). Kept only when the buses run clearly more
+    parallel and no connection is lost; otherwise everything is rolled back."""
     import buses as bus_tools
     kept = []
     pad_of, net_pads = {}, {}
@@ -1293,125 +1351,154 @@ def rebundle(bus_data):
         for p in f.Pads():
             if p.GetNetname():
                 pad_of[(f.GetReference(), p.GetNetname())] = p
-                net_pads.setdefault(p.GetNetname(), []).append(p)
+                net_pads.setdefault(p.GetNetname(), []).append((f.GetReference(), p))
 
     def where(p):
         return (TO(p.GetPosition().x), TO(p.GetPosition().y)), [l for l in layers if p.IsOnLayer(l)]
-    baseline = open_connections()
+
+    def span(bus):
+        d = [math.dist(where(pad_of[(bus["from"], n)])[0], where(pad_of[(bus["to"], n)])[0]) for n in bus["nets"]]
+        return sum(d) / len(d)
+
+    def weighted(buses_):
+        tot = tog = 0.0
+        for bus in buses_:
+            share, length = bus_tools.parallelism(b, bus)
+            tot += length
+            tog += share * length
+        return tog / tot if tot else 0.0
+
+    groups = []
     for bus in bus_data.get("detail", []):
-        if time.time() > t_start + ns.time_budget:
-            break
-        nets = [n for n in bus["nets"] if 2 <= len(net_pads.get(n, [])) <= 4
+        nets = [n for n in bus["nets"] if 2 <= len(net_pads.get(n, [])) <= 6
                 and (bus["from"], n) in pad_of and (bus["to"], n) in pad_of]
         if len(nets) < 3:
             continue
-        sub_bus = dict(bus, nets=nets)
-        before, _len = bus_tools.parallelism(b, sub_bus)
-        old = [t for t in b.GetTracks() if t.GetNetname() in nets and not t.IsLocked()]
-        if not old:
-            continue
-        removed_items = [(i, it) for i, it in enumerate(items) if it is not None and it[0] in nets and it[2] in ("seg", "disc")]
-        for i, _it in removed_items:
-            items[i] = None
-        for o in old:
-            b.Remove(o)
-        n_items, n_holes = len(items), len(holes)
-        new, ok, segs_of = [], True, {}
-        displaced = []   # (index, entry) of other nets' tracks a bundle pushed aside
-        pitch_all = bus_pitch(nets)
-        for net, nb in bundle_order(nets):
-            pa, pb = pad_of[(bus["from"], net)], pad_of[(bus["to"], net)]
-            a_ = (TO(pa.GetPosition().x), TO(pa.GetPosition().y))
-            b_ = (TO(pb.GetPosition().x), TO(pb.GetPosition().y))
-            w = classes.width(net)
-            lane_args = dict(attract=segs_of.get(nb), pitch=(w + need(net, nb)) if nb else 0.0)
-            la_b, lb_b = [l for l in layers if pa.IsOnLayer(l)], [l for l in layers if pb.IsOnLayer(l)]
-            path = follow(net, a_, b_, la_b, lb_b, w, lane_args["attract"], lane_args["pitch"],
-                          reserve=math.ceil((len(nets) - 1) / 2) * pitch_all)
-            pushed = False
-            if not path and ns.max_rip > 0:
-                # no free lane: the bundle may push unlocked tracks of other nets aside
-                path = route(net, a_, b_, la_b, lb_b, w, 0.0, t_start + ns.time_budget, soft=True, **lane_args)
-                pushed = path is not None
-            if not path:
-                say(f"rebundle {bus['from']}->{bus['to']}: {net} finds no lane")
-                ok = False
-                break
-            first = len(items)
-            made = insert(net, path, w)
-            new += made
-            for k in range(first, len(items)):   # the bundle itself must not be pushed aside
-                if items[k] is not None:
-                    items[k] = items[k][:4] + (None,)
-            if pushed:
-                for idx in victims_of(made, net):
-                    entry = items[idx]
-                    if entry is None or entry[0] in nets or entry[2] != "seg":
-                        continue
-                    b.Remove(entry[4])
-                    displaced.append((idx, entry))
-                    items[idx] = None
-            segs_of[net] = [(o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x),
-                             TO(o.GetEnd().y)) for o in made if o.GetClass() == "PCB_TRACK"]
-            # the net's other pads (a pull-up, a second part) join the nearest pad already connected
-            joined = [pa, pb]
-            for extra_pad in [q for q in net_pads[net] if q.m_Uuid.AsString() not in
-                              {pa.m_Uuid.AsString(), pb.m_Uuid.AsString()}]:
-                (xa, la_), = [where(extra_pad)]
-                target = min(joined, key=lambda q: math.hypot(where(q)[0][0] - xa[0], where(q)[0][1] - xa[1]))
-                xt, lt = where(target)
-                branch = route(net, xa, xt, la_, lt, w, 0.0, t_start + ns.time_budget)
-                if not branch:
+        sub = dict(bus, nets=nets)
+        g = next((g for g in groups if any(set(x["nets"]) & set(nets) for x in g)), None)
+        if g:
+            g.append(sub)
+        else:
+            groups.append([sub])
+    baseline = open_connections()
+    for group in groups:
+        if time.time() > t_start + ns.time_budget:
+            break
+        all_nets = {n for bus in group for n in bus["nets"]}
+        label = ", ".join(f"{bus['from']}->{bus['to']}" for bus in group)
+        before = weighted(group)
+        if before >= 0.75 or any(t.IsLocked() and t.GetNetname() in all_nets for t in b.GetTracks()):
+            continue   # bundled already, or laid (locked) by the user or the bus pre-route
+        mark = len(journal)
+        old_segs = {}   # where each net ran before: the corridor for a bundle that has to push others aside
+        for i, it in enumerate(items):
+            if it is not None and it[0] in all_nets and it[4] is not None:
+                if it[2] == "seg":
+                    old_segs.setdefault(it[0], []).append((it[1][0],) + tuple(it[3][:4]))
+                take_out(i)
+        joined = {}   # net -> sets of parts joined by the new bundles
+
+        def grp(net, ref):
+            return next((s_ for s_ in joined.get(net, []) if ref in s_), {ref})
+        pushed, ok, laid_segs = {}, True, {}
+        for bus in sorted(group, key=span):
+            todo = [n for n in bus["nets"] if bus["to"] not in grp(n, bus["from"])]
+            if not todo:
+                continue
+            segs_of = {n: laid_segs[n] for n in bus["nets"] if n not in todo and n in laid_segs}
+            pitch_all = bus_pitch(bus["nets"])
+            order_ = bus["nets"]
+            for net, nb in bundle_order(order_):
+                if net not in todo:
+                    continue
+                if nb is not None and nb not in segs_of:
+                    i_net, i_nb = order_.index(net), order_.index(nb)
+                    step = 1 if i_nb > i_net else -1
+                    nb = next((order_[k] for k in range(i_nb, len(order_) if step > 0 else -1, step)
+                               if order_[k] in segs_of), None)
+                (a_, la_b), (b_, lb_b) = where(pad_of[(bus["from"], net)]), where(pad_of[(bus["to"], net)])
+                w = classes.width(net)
+                pitch = (w + need(net, nb)) if nb else 0.0
+                path = follow(net, a_, b_, la_b, lb_b, w, segs_of.get(nb), pitch,
+                              reserve=math.ceil((len(order_) - 1) / 2) * pitch_all)
+                soft = False
+                if not path and ns.max_rip > 0:
+                    # no free lane: the bundle may push unlocked tracks of other nets aside, searched
+                    # in a corridor along its neighbour (the middle net: along its own old route)
+                    lane = segs_of.get(nb) or old_segs.get(net)
+                    path = follow(net, a_, b_, la_b, lb_b, w, lane, pitch if segs_of.get(nb) else 0.0, soft=True)
+                    soft = path is not None
+                if not path:
+                    say(f"rebundle {bus['from']}->{bus['to']}: {net} finds no lane")
                     ok = False
                     break
-                new += insert(net, branch, w)
-                joined.append(extra_pad)
+                first = len(items)
+                made = insert(net, path, w)
+                for k in range(first, len(items)):   # the bundle itself must not be pushed aside
+                    if items[k] is not None:
+                        items[k] = items[k][:4] + (None,)
+                if soft:
+                    for vnet, (segs, vias, vw) in displace(made, net, all_nets).items():
+                        old = pushed.get(vnet, ([], [], None))
+                        pushed[vnet] = (old[0] + segs, old[1] + vias, vw or old[2])
+                    if len(pushed) > 8:
+                        say(f"rebundle {bus['from']}->{bus['to']}: would push {len(pushed)} nets aside")
+                        ok = False
+                        break
+                segs_of[net] = laid_segs[net] = laid_segs.get(net, []) + [
+                    (o.GetLayer(), TO(o.GetStart().x), TO(o.GetStart().y), TO(o.GetEnd().x), TO(o.GetEnd().y))
+                    for o in made if o.GetClass() == "PCB_TRACK"]
+                sets = joined.setdefault(net, [])
+                ga, gb = grp(net, bus["from"]), grp(net, bus["to"])
+                sets[:] = [s_ for s_ in sets if s_ is not ga and s_ is not gb] + [ga | gb]
             if not ok:
                 break
-        if ok and displaced:
-            # the pushed-aside nets are routed again between the loose ends their tracks left
-            by_net = {}
-            for _idx, entry in displaced:
-                by_net.setdefault(entry[0], []).append((entry[4].GetLayer(),) + tuple(entry[3][:4]))
-            for vnet, segs in by_net.items():
-                width = next(e[3][4] * 2 for _i, e in displaced if e[0] == vnet)
-                for chain in segment_chains(segs):
-                    loose = cut_ends(chain)
-                    if len(loose) != 2:
+        if ok:
+            # pads no bundle reached (a pull-up, a part of a bus that was not laid) join the nearest
+            # pad already connected
+            for net in all_nets:
+                done_refs = set().union(*joined.get(net, [set()]))
+                conn = [p for ref, p in net_pads[net] if ref in done_refs]
+                rest = [p for ref, p in net_pads[net] if ref not in done_refs]
+                if not conn:
+                    conn, rest = rest[:1], rest[1:]
+                w = classes.width(net)
+                for q in rest:
+                    xq, lq = where(q)
+                    t_ = min(conn, key=lambda c: math.dist(where(c)[0], xq))
+                    xt, lt = where(t_)
+                    br = route(net, xq, xt, lq, lt, w, 0.0, t_start + ns.time_budget)
+                    if br:
+                        insert(net, br, w)
+                    elif not ripup(net, xq, xt, lq, lt, w, 0.0, t_start + ns.time_budget):
+                        say(f"rebundle {label}: {net} pad {q.GetNumber()} not joined")
                         ok = False
                         break
-                    (l1, x1, y1), (l2, x2, y2) = loose
-                    again = route(vnet, (x1, y1), (x2, y2), [l1], [l2], width, 0.0, t_start + ns.time_budget)
-                    if not again:
-                        ok = False
-                        break
-                    new += insert(vnet, again, width)
+                    conn.append(q)
                 if not ok:
                     break
-            say(f"rebundle {bus['from']}->{bus['to']}: pushed {len(displaced)} tracks of {len(by_net)} nets aside, "
-                f"{'re-routed' if ok else 'could not re-route them'}")
+        if ok and pushed:
+            for vnet, (segs, vias, vw) in pushed.items():
+                ends = cut_ends(segs, vias)
+                if len(ends) < 2 or any(e[0] is None for e in ends) or not vw:
+                    say(f"rebundle {label}: pushed {vnet} leaves {len(ends)} loose ends")
+                    ok = False
+                    break
+                if not rejoin(vnet, ends, vw, t_start + ns.time_budget, ns.rip_depth):
+                    say(f"rebundle {label}: pushed {vnet} could not be routed again")
+                    ok = False
+                    break
         if ok:
-            after, _len = bus_tools.parallelism(b, sub_bus)
-            say(f"rebundle {bus['from']}->{bus['to']} ({len(nets)} nets): parallel {before:.2f} -> {after:.2f}")
-            if after >= before + 0.1:
+            after = weighted(group)
+            say(f"rebundle {label}: parallel {before:.2f} -> {after:.2f}, pushed {len(pushed)} nets")
+            if after >= before + 0.05:
                 now = open_connections()
                 say(f"  open connections {baseline} -> {now}")
                 if now <= baseline:
                     baseline = now
-                    kept.append(f"{bus['from']}->{bus['to']} parallel {before:.2f}->{after:.2f}")
+                    kept.append(f"{label} parallel {before:.2f}->{after:.2f}")
                     continue
-        for o in new:
-            b.Delete(o)
-        for i in range(n_items, len(items)):
-            items[i] = None
-        del holes[n_holes:]
-        for o in old:
-            b.Add(o)
-        for i, it in removed_items:
-            items[i] = it
-        for i, entry in displaced:
-            b.Add(entry[4])
-            items[i] = entry
+        rollback(mark)
     open_connections()
     return kept
 

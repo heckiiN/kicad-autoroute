@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import dsn_fix, render_board, router, tools
@@ -120,27 +121,48 @@ def drc_all(pcb: Path) -> Path:
 
 
 def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, rounds: int = 6,
-           buses_json: Path | None = None, unlock_against: Path | None = None) -> list[str]:
+           buses_json: Path | None = None, unlock_against: Path | None = None, time_limit: float = 2400) -> list[str]:
     """Close what the router left: replace necked tracks, last-mile route open connections, drop
     dangling leftovers and too-close vias, repeat; then clean up the silkscreen. unlock_against: the
     user's board; if connections stay open, what the pipeline locked itself (bus bundles, stitching
-    links) may be ripped up after all, the user's own locked routes stay."""
+    links) may be ripped up after all, the user's own locked routes stay.
+    time_limit: seconds for all last-mile router calls together; on large boards every call could
+    otherwise use its full budget in every round. The clean-up steps (dropping offenders, silkscreen)
+    always run."""
     notes = []
+    end = time.time() + time_limit
+
+    def lastmile(*args) -> None:
+        left = end - time.time()
+        if left < 60:
+            notes.append("lastmile: skipped, finishing time used up")
+            return
+        notes.append(kpy(HERE / "lastmile.py", pcb, *args, "--min-width", min_w or 0.15,
+                         "--time-budget", round(min(900, left)), timeout=round(min(1500, left + 300)), fatal=False))
+
     if min_w:
         notes.append(steps("drop_narrow", pcb, min_w))
+
+    last_state, stuck = [None], [False]
 
     def one_round() -> bool:
         report = pcb.with_name(pcb.stem + "_drc_err.json")
         subprocess.run([str(tools.kicad_cli()), "pcb", "drc", "--refill-zones", "--format", "json", "--severity-error",
                         "-o", str(report), str(pcb)], capture_output=True, text=True, timeout=3600)
         if json.loads(report.read_text(encoding="utf-8")).get("unconnected_items"):
-            notes.append(kpy(HERE / "lastmile.py", pcb, report, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+            lastmile(report)
         full = drc_all(pcb)
         data = json.loads(full.read_text(encoding="utf-8"))
         kinds = {v.get("type") for v in data.get("violations", [])}
         errors = {v.get("type") for v in data.get("violations", []) if v.get("severity") == "error"}
         if not kinds & {"track_dangling", "via_dangling", "hole_to_hole"} and not errors and not data.get("unconnected_items"):
             return True
+        state = json.dumps([sorted(v.get("type", "") for v in data.get("violations", [])),
+                            sorted(str(sorted(i.get("uuid", "") for i in u.get("items", [])))
+                                   for u in data.get("unconnected_items", []))])
+        if state == last_state[0]:
+            stuck[0] = True    # the same as after the previous round: more rounds would not change it
+        last_state[0] = state
         notes.append(steps("drop_dangling", pcb, full))
         notes.append(steps("drop_close_vias", pcb, full))
         notes.append(steps("drop_offenders", pcb, full))
@@ -151,32 +173,43 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
             # pads whose thermal relief does not reach the pour: short tracks into the main pour
             req = pcb.with_name(pcb.stem + "_thermal.json")
             req.write_text(json.dumps({"unconnected_items": thermal}), encoding="utf-8")
-            notes.append(kpy(HERE / "lastmile.py", pcb, req, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+            lastmile(req)
         islands = pcb.with_name(pcb.stem + "_islands.json")
         if islands.exists() and json.loads(islands.read_text(encoding="utf-8")).get("unconnected_items"):
-            notes.append(kpy(HERE / "lastmile.py", pcb, islands, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+            lastmile(islands)
         return False
 
     for _ in range(rounds):
-        if one_round():
+        if one_round() or stuck[0]:
             break
-    if unlock_against and drc(pcb)["unconnected"]:
+        if time.time() > end:
+            one_round()  # clean-up only, the last-mile calls are skipped from now on
+            break
+    if unlock_against and time.time() < end and drc(pcb)["unconnected"]:
         # completeness before tidiness: bundles and stitching links that block the last connections
         # may be ripped up
         notes.append(steps("unlock_new", pcb, unlock_against))
+        stuck[0] = False
         for _ in range(2):
-            if one_round():
+            if one_round() or stuck[0]:
                 break
     # clean-up a person would do, each kept only if the board is not worse afterwards (open
     # connections, DRC errors): buses re-laid as bundles, then nets re-routed with fewer vias
     passes = [("rebundle", [buses_json, "--rebundle"])] if buses_json and buses_json.exists() else []
     passes.append(("reduce_vias", ["--reduce-vias"]))
     for label, args in passes:
+        if time.time() > end - 60:
+            notes.append(f"{label}: skipped, finishing time used up")
+            continue
         before = drc(pcb)
         backup = pcb.with_name(pcb.stem + f"_before_{label}.kicad_pcb")
         shutil.copyfile(pcb, backup)
-        notes.append(kpy(HERE / "lastmile.py", pcb, *args, "--min-width", min_w or 0.15, timeout=1500, fatal=False))
+        lastmile(*args)
         after = drc(pcb)
+        if (after["unconnected"], after["error_count"]) > (before["unconnected"], before["error_count"]):
+            # a re-laid net may have cut a pour apart or left a gap: one repair round first
+            one_round()
+            after = drc(pcb)
         if (after["unconnected"], after["error_count"]) > (before["unconnected"], before["error_count"]):
             shutil.copyfile(backup, pcb)
             notes.append(f"{label}: undone (board got worse)")
@@ -185,10 +218,15 @@ def finish(pcb: Path, min_w: float, original: Path, texts_from_original: bool, r
     return notes
 
 
-def score_session(pre: Path, ses: Path, out_dir: Path, post_zones: list, min_w: float) -> dict:
+def score_session(pre: Path, ses: Path, out_dir: Path, post_zones: list, min_w: float) -> dict | None:
+    """The routed session imported into KiCad and scored; None when KiCad cannot import it (its
+    importer can fail or hang on a session; that candidate is then left out, not the whole run)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     pcb = copy_project(pre, out_dir, ses.stem)
-    steps("import", pcb, ses.resolve(), pcb)
+    res = kpy(HERE / "kicad_steps.py", "import", pcb, ses.resolve(), pcb, timeout=900, fatal=False)
+    if not res.endswith("import: ok"):
+        log(f"{ses.stem}: session import failed, left out ({res.splitlines()[-1] if res else 'no output'})")
+        return None
     if post_zones:
         steps("zones", pcb, json.dumps(post_zones))
     result = drc(pcb)
@@ -242,8 +280,9 @@ def pick_candidates(scored: list[dict], n: int, bus_reach: int = 0) -> list[dict
     ranked = sorted(scored, key=rank_key)
     picked, variants = [], set()
     # a variant that leaves many more connections open is not worth finishing (the last-mile router
-    # would spend its whole budget on it); a few more are fine, styles often finish cleaner
-    reach = ranked[0]["unconnected"] + 6 if ranked else 0
+    # would spend its whole budget on it); a few more are fine, styles often finish cleaner. The
+    # finishing time is bounded, so on larger boards the reach grows with what is open.
+    reach = ranked[0]["unconnected"] + max(6, ranked[0]["unconnected"] // 4) if ranked else 0
     for r in ranked:
         stem = Path(r["ses"]).stem
         variant = next((t for t in ("_1L", "_main", "_rebus", "_bus") if stem.endswith(t)), "")
@@ -462,6 +501,8 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
     for ses in sorted((work / "route").glob("*.ses")):
         base = bus_pre if ses.stem.endswith("_bus") and bus_pre else pre
         r = score_session(base, ses, work / "score" / ses.stem, post, min_w)
+        if r is None:
+            continue
         r["off_share"] = off_share(r, main_layer)
         r["parallel"] = bus_parallel(Path(r["board"]), buses_json)
         log(f"{ses.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} "
@@ -489,6 +530,8 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
         router.run_matrix(jobs, min(workers, n), work / "route", timeout, fr.get("max_passes", 100), "rebus")
         for ses in sorted((work / "route").glob("*_rebus.ses")):
             r = score_session(rebus, ses, work / "score" / ses.stem, post, min_w)
+            if r is None:
+                continue
             r["off_share"] = off_share(r, main_layer)
             r["parallel"] = bus_parallel(Path(r["board"]), buses_json)
             log(f"{ses.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} "
@@ -498,18 +541,22 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
 
     # 9: finish the best candidates (last mile, clean-up, silkscreen), keep the best finished board
     finish_cfg = cfg.get("finish", {})
-    finished = []
-    for cand in pick_candidates(scored, finish_cfg.get("candidates", 2), finish_cfg.get("bus_reach", 0)):
+    def finish_one(cand: dict) -> dict:
         pcb = Path(cand["board"])
         notes = finish(pcb, min_w, src, place.get("mode", "none") == "compact" or finish_cfg.get("texts_from_original", False),
-                       buses_json=buses_json, unlock_against=src)
+                       buses_json=buses_json, unlock_against=src, time_limit=finish_cfg.get("time_limit", 2400))
         r = drc(pcb)
         r.update(json.loads(steps("stats", pcb).splitlines()[-1]))
         r["off_share"] = off_share(r, main_layer)
         r["parallel"] = bus_parallel(pcb, buses_json)
         r.update({"ses": cand["ses"], "board": str(pcb), "notes": notes, "raw": {k: cand[k] for k in ("unconnected", "errors", "vias", "track_mm")}})
         log(f"finished {pcb.stem}: unconnected={r['unconnected']} errors={r['errors']} vias={r['vias']} track_mm={r['track_mm']}")
-        finished.append(r)
+        return r
+
+    # the candidates are separate copies: finish them side by side
+    cands = pick_candidates(scored, finish_cfg.get("candidates", 3), finish_cfg.get("bus_reach", 6))
+    with ThreadPoolExecutor(max(1, min(len(cands), finish_cfg.get("workers", 3)))) as pool:
+        finished = list(pool.map(finish_one, cands))
     best = select_best(finished)
 
     # 10: result + report
