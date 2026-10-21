@@ -13,6 +13,7 @@ import math
 import os
 import sys
 
+import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

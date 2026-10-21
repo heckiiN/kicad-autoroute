@@ -45,11 +45,15 @@ def kpy(script: Path, *args: str, timeout: int = 3600, fatal: bool = True) -> st
         if fatal:
             raise SystemExit(f"{script.name} {' '.join(map(str, args))} timed out after {timeout} s")
         return f"{script.name}: timed out after {timeout} s, skipped"
-    out = "\n".join(l for l in (res.stdout + res.stderr).splitlines()
-                    if "image handler" not in l and "memory leak" not in l)
+
+    def clean(text: str) -> str:
+        return "\n".join(l for l in text.splitlines() if "image handler" not in l and "memory leak" not in l).strip()
+    # KiCad's messages (stderr) first: callers read their result from the last line of stdout
+    out = "\n".join(x for x in (clean(res.stderr), clean(res.stdout)) if x)
     if res.returncode != 0:
         if not fatal:
-            last = out.strip().splitlines()[-1] if out.strip() else "no output"
+            err = clean(res.stderr) or out
+            last = err.splitlines()[-1] if err else "no output"
             return f"{script.name}: failed, skipped ({last})"
         raise SystemExit(f"{script.name} {' '.join(map(str, args))} failed:\n{out[-2000:]}")
     return out.strip()

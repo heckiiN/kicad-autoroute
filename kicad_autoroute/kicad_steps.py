@@ -29,6 +29,7 @@ import json
 from pathlib import Path
 import sys
 
+import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 TO, FROM = pcbnew.ToMM, pcbnew.FromMM

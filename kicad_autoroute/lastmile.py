@@ -21,6 +21,7 @@ import sys
 import time
 
 import numpy as np
+import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

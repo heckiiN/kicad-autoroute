@@ -14,6 +14,7 @@
 import argparse
 import math
 
+import headless  # noqa: F401  (first: KiCad's message boxes go to stderr)
 import pcbnew
 
 ap = argparse.ArgumentParser()
