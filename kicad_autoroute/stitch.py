@@ -193,8 +193,11 @@ for f, p in todo:
         continue
     if share_reach > 0:
         tw0 = ns.link_width if min(hw, hh) * 2 >= ns.fine_pad else ns.fine_link_width
-        near = sorted((math.hypot(ax - px, ay - py), ax, ay, al, ap) for ax, ay, al, ap in anchors[cur_net]
-                      if math.hypot(ax - px, ay - py) <= share_reach and (al is None or al == layer))
+        # sorted by distance and position only: on a tie Python would compare the pads themselves,
+        # which KiCad answers with an assert dialog that blocks a headless run
+        near = sorted(((math.hypot(ax - px, ay - py), ax, ay, al, ap) for ax, ay, al, ap in anchors[cur_net]
+                       if math.hypot(ax - px, ay - py) <= share_reach and (al is None or al == layer)),
+                      key=lambda t: t[:3])
         done_link = False
         # a pin in a row leaves straight out of the row first (a knee), then heads for the anchor
         ox, oy = px - fcx, py - fcy
