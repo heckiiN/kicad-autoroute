@@ -66,7 +66,7 @@ board's own limits) are counted apart.
 | complex_hierarchy | 2 / 68 | 0 / 0 | **0 / 0** | 0 | 4 min |
 | StickHub | 2 / 94 | 0 / 0 | **0–1 / 0** | 0 | 6–13 min |
 | CM5_MINIMA_3 | 4 / 112 | 0 / 2 | **1 / 2** | 0 | 60 min |
-| One-Air-Max | 2 / 210 | 0 / 226 | **3 / 27** | 0 | 68 min |
+| One-Air-Max | 2 / 210 | 0 / 226 | **0–3 / 27** | 0 | 50–68 min |
 | RoyalBlue54L-Feather | 6 / 71 | 0 / 237 | **11–14 / 51** | 0 | 75–80 min |
 | video | 4 / 189 | 0 / 0 | **187 / 0** | 0 | 1.7 h |
 | private board | 4 / 158 | 0 / 0 | **0–1 / 0** | 0 | 30–55 min |
