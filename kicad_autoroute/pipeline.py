@@ -451,6 +451,17 @@ def run(cfg: dict, base: Path, label: str = "") -> dict:
             dsn_bus = dsn.with_name(dsn.stem + "_bus.dsn")
             log(steps("export", bus_pre, dsn_bus))
 
+    # bus nets attract each other in Freerouting (patched router): a net's path costs less where it
+    # runs alongside a bus neighbour already routed, so buses come out as bundles in every variant,
+    # without walls of pre-laid copper the router would have to work around
+    attraction = fr.get("bus_attraction", 0.9)
+    if attraction and buses_json.exists():
+        pairs = sorted({(a, b) for bus in json.loads(buses_json.read_text(encoding="utf-8"))["detail"]
+                        for a, b in zip(bus["nets"], bus["nets"][1:])})
+        neighbours = work / "route" / "bus_neighbours.tsv"
+        neighbours.write_text("".join(f"{a}\t{b}\n" for a, b in pairs), encoding="utf-8")
+        extra += [f"env:FREEROUTING_BUS_NEIGHBOURS={neighbours}", f"env:FREEROUTING_BUS_DISCOUNT={attraction}"]
+
     # 7: route
     seeds = fr.get("seeds", 4)
     # 2-layer boards get routing variants next to the plain one: the main side preferred (most copper

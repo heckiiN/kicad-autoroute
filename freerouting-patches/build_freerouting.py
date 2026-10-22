@@ -17,7 +17,7 @@ from pathlib import Path
 
 UPSTREAM = "https://github.com/freerouting/freerouting.git"
 COMMIT = "5aa1b24dc8e5af7f950c551c1e53de9077a84cd5"
-PATCHES = ["0001-min-trace-width.patch"]
+PATCHES = ["0001-min-trace-width.patch", "0002-bus-attraction.patch"]
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent

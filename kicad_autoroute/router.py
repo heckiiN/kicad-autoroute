@@ -7,6 +7,7 @@ its log.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -68,13 +69,19 @@ def run_once(board: Path, config: str, extra: list[str], out_dir: Path, timeout:
         "--router.optimizer.enabled=false", f"--router.job_timeout={timeout}",
         f"--router.autorouter.max_passes={max_passes}",
     ] + extra
+    # "env:NAME=value" entries are environment settings of the patched router, not options
+    env = dict(os.environ)
+    for a in [a for a in extra if a.startswith("env:")]:
+        name, _, value = a[4:].partition("=")
+        env[name] = value
+    cmd = [c for c in cmd if not str(c).startswith("env:")]
     res = RunResult(board=board.stem, config=config, args=extra)
     h, m, s = (int(x) for x in timeout.split(":"))
     hard_timeout = h * 3600 + m * 60 + s + 180
     start = time.time()
     try:
         with open(log, "w", encoding="utf-8", errors="replace") as fh:
-            subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, timeout=hard_timeout, check=False)
+            subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT, timeout=hard_timeout, check=False, env=env)
     except subprocess.TimeoutExpired:
         res.error = "hard timeout"
     res.wall_s = round(time.time() - start, 1)

@@ -63,6 +63,8 @@ max_seeds = 12          # ... up to this many
 single_layer = true     # 2-layer boards: also try single-sided routing (jumpers added when finishing)
 other_layer_cost = 3.0  # 2-layer boards: also try with traces on the second side this much dearer
 via_costs = 120         # Freerouting via cost (its default is 50); higher keeps routes in their layer
+bus_attraction = 0.9    # bus nets run alongside their routed bus neighbours (patched Freerouting): path cost
+                        # there drops by this share; 0 turns it off
 max_passes = 100
 stop_at_stagnation = true   # stop when passes stop improving; the finishing pass closes the rest
 min_trace_width = true      # pass the board's minimum track width to the router

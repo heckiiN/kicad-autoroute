@@ -1,0 +1,221 @@
+diff --git a/src/main/java/app/freerouting/autoroute/maze/BusAttraction.java b/src/main/java/app/freerouting/autoroute/maze/BusAttraction.java
+new file mode 100644
+index 00000000..5bc4e502
+--- /dev/null
++++ b/src/main/java/app/freerouting/autoroute/maze/BusAttraction.java
+@@ -0,0 +1,169 @@
++package app.freerouting.autoroute.maze;
++
++import app.freerouting.board.facade.RoutingBoard;
++import app.freerouting.board.model.items.Item;
++import app.freerouting.board.trace.PolylineTrace;
++import app.freerouting.geometry.planar.FloatPoint;
++import app.freerouting.logger.FRLogger;
++import app.freerouting.rules.Net;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Makes the maze search prefer running alongside the already routed traces of a net's bus
++ * neighbours, so the nets of a bus come out as a bundle, the way people route them.
++ *
++ * <p>The neighbour pairs come from a file named by the environment variable {@code
++ * FREEROUTING_BUS_NEIGHBOURS}: one pair of net names per line, separated by a tab. Without it
++ * nothing changes. A path step whose sample points lie close to a neighbour's trace on the same
++ * layer, running in the same direction, costs less: down to {@code 1 - FREEROUTING_BUS_DISCOUNT}
++ * (default 0.5) of its length cost. {@code FREEROUTING_BUS_NEAR} scales the distance that counts
++ * as close (default 1: twelve trace half widths).
++ */
++final class BusAttraction {
++
++  private static final int SAMPLES = 4;
++
++  /** The sine of the largest angle between a step and a neighbour trace that counts as parallel. */
++  private static final double MAX_CROSS = 0.3;
++
++  private static Map<String, List<String>> neighbourNames;
++  private static boolean loaded;
++  private static double discount = 0.5;
++  private static double nearFactor = 1.0;
++
++  /** Segments of the neighbour traces per layer: x1, y1, x2, y2. */
++  private final Map<Integer, List<double[]>> segmentsByLayer = new HashMap<>();
++
++  private final double nearSquare;
++
++  private BusAttraction(double near) {
++    this.nearSquare = near * near;
++  }
++
++  private static synchronized Map<String, List<String>> neighbourNames() {
++    if (loaded) {
++      return neighbourNames;
++    }
++    loaded = true;
++    String file = System.getenv("FREEROUTING_BUS_NEIGHBOURS");
++    if (file == null || file.isBlank()) {
++      return null;
++    }
++    discount = numberFromEnvironment("FREEROUTING_BUS_DISCOUNT", discount);
++    nearFactor = numberFromEnvironment("FREEROUTING_BUS_NEAR", nearFactor);
++    Map<String, List<String>> result = new HashMap<>();
++    try {
++      for (String line : Files.readAllLines(Path.of(file), StandardCharsets.UTF_8)) {
++        String[] parts = line.split("\t");
++        if (parts.length != 2) {
++          continue;
++        }
++        result.computeIfAbsent(parts[0], k -> new ArrayList<>()).add(parts[1]);
++        result.computeIfAbsent(parts[1], k -> new ArrayList<>()).add(parts[0]);
++      }
++    } catch (IOException e) {
++      FRLogger.warn("bus neighbours file could not be read: " + file);
++      return null;
++    }
++    neighbourNames = result;
++    FRLogger.info("bus attraction: " + result.size() + " bus nets, discount " + discount);
++    return neighbourNames;
++  }
++
++  private static double numberFromEnvironment(String name, double fallback) {
++    String text = System.getenv(name);
++    if (text == null || text.isBlank()) {
++      return fallback;
++    }
++    try {
++      return Double.parseDouble(text.trim());
++    } catch (NumberFormatException e) {
++      FRLogger.warn(name + " is not a number: " + text);
++      return fallback;
++    }
++  }
++
++  /**
++   * The attraction for routing a connection of the given net, or null when the net is no bus net
++   * or none of its neighbours has traces yet.
++   */
++  static BusAttraction forNet(RoutingBoard board, int netNumber, double near) {
++    Map<String, List<String>> names = neighbourNames();
++    if (names == null || board == null || board.rules == null) {
++      return null;
++    }
++    Net net = board.rules.nets.get(netNumber);
++    if (net == null || !names.containsKey(net.name)) {
++      return null;
++    }
++    BusAttraction result = new BusAttraction(near * nearFactor);
++    for (String neighbourName : names.get(net.name)) {
++      for (Net neighbour : board.rules.nets.get(neighbourName)) {
++        for (Item item : board.getConnectableItems(neighbour.netNumber)) {
++          if (!(item instanceof PolylineTrace trace)) {
++            continue;
++          }
++          FloatPoint[] corners = trace.polyline().cornerApproxArr();
++          List<double[]> segments =
++              result.segmentsByLayer.computeIfAbsent(trace.getLayer(), k -> new ArrayList<>());
++          for (int i = 0; i + 1 < corners.length; i++) {
++            segments.add(
++                new double[] {corners[i].x, corners[i].y, corners[i + 1].x, corners[i + 1].y});
++          }
++        }
++      }
++    }
++    return result.segmentsByLayer.isEmpty() ? null : result;
++  }
++
++  /**
++   * Cost factor for a path step from {@code from} to {@code to} on {@code layer}: 1 away from the
++   * neighbours, down to 1 - discount where the whole step runs alongside one.
++   */
++  double factor(int layer, FloatPoint from, FloatPoint to) {
++    List<double[]> segments = segmentsByLayer.get(layer);
++    if (segments == null) {
++      return 1.0;
++    }
++    double dx = to.x - from.x;
++    double dy = to.y - from.y;
++    double length = Math.sqrt(dx * dx + dy * dy);
++    if (length <= 0) {
++      return 1.0;
++    }
++    int alongside = 0;
++    for (int k = 0; k < SAMPLES; k++) {
++      double t = (k + 0.5) / SAMPLES;
++      if (nearParallelSegment(segments, from.x + t * dx, from.y + t * dy, dx, dy, length)) {
++        alongside++;
++      }
++    }
++    return 1.0 - discount * alongside / SAMPLES;
++  }
++
++  private boolean nearParallelSegment(
++      List<double[]> segments, double px, double py, double dx, double dy, double length) {
++    for (double[] s : segments) {
++      double sx = s[2] - s[0];
++      double sy = s[3] - s[1];
++      double sl = Math.sqrt(sx * sx + sy * sy);
++      if (sl <= 0 || Math.abs(dx * sy - dy * sx) / (length * sl) > MAX_CROSS) {
++        continue;
++      }
++      double u = Math.max(0, Math.min(1, ((px - s[0]) * sx + (py - s[1]) * sy) / (sl * sl)));
++      double qx = s[0] + u * sx - px;
++      double qy = s[1] + u * sy - py;
++      if (qx * qx + qy * qy <= nearSquare) {
++        return true;
++      }
++    }
++    return false;
++  }
++}
+diff --git a/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java b/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java
+index eb27ef59..36dd44d0 100644
+--- a/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java
++++ b/src/main/java/app/freerouting/autoroute/maze/MazeSearchEngine.java
+@@ -48,6 +48,9 @@ public class MazeSearchEngine {
+ 
+   final AutorouteControl ctrl;
+ 
++  /** Lower path costs alongside the traces of the net's bus neighbours, null for other nets. */
++  private final BusAttraction busAttraction;
++
+   /** The queue of expanded elements used in this search algorithm. */
+   final SortedSet<MazeListElement> mazeExpansionList;
+ 
+@@ -80,6 +83,12 @@ public class MazeSearchEngine {
+         ctrl.ripupCosts); // Keep v1.9 deterministic randomization across passes.
+     this.searchTree = autorouteEngine.autorouteSearchTree;
+     this.expansionEngine = new MazeExpansionEngine(this);
++    int maxHalfWidth = 0;
++    for (int halfWidth : ctrl.traceHalfWidth) {
++      maxHalfWidth = Math.max(maxHalfWidth, halfWidth);
++    }
++    this.busAttraction =
++        BusAttraction.forNet(autorouteEngine.board, ctrl.netNumber, 12.0 * maxHalfWidth);
+     this.ripupResolver = new MazeRipupResolver(this);
+     mazeExpansionList =
+         new TreeSet<>() {
+@@ -888,9 +897,15 @@ public class MazeSearchEngine {
+             + addCosts
+             + bendCostPenalty
+             + shapeEntryMiddle.weightedDistance(
+-                fromElement.shapeEntry.a.middlePoint(fromElement.shapeEntry.b),
+-                ctrl.traceCosts[layer].horizontal(),
+-                ctrl.traceCosts[layer].vertical());
++                    fromElement.shapeEntry.a.middlePoint(fromElement.shapeEntry.b),
++                    ctrl.traceCosts[layer].horizontal(),
++                    ctrl.traceCosts[layer].vertical())
++                * (busAttraction == null
++                    ? 1.0
++                    : busAttraction.factor(
++                        layer,
++                        fromElement.shapeEntry.a.middlePoint(fromElement.shapeEntry.b),
++                        shapeEntryMiddle));
+     double sortingValue =
+         expansionValue + this.destinationDistance.calculate(shapeEntryMiddle, layer);
+     boolean roomRipped =
