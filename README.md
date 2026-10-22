@@ -50,8 +50,12 @@ hand-routed original: complete (0 open, 0 errors), at most 1.1 × the human's vi
 neighbouring pins between two parts) at least as bundled as the human laid them (share of bus length
 running alongside its neighbour, human − 0.05), and on 2-layer boards as much copper on the main side
 (human − 0.10). Five of six demo boards pass all four. kit-dev-coldfire does not yet: its vias are
-at the human's count now (241–256 against 253), but 0–2 connections stay open depending on the run,
-and its buses are 0.24–0.33 bundled against the human's 0.80.
+at the human's count now (234–268 against 253), but 0–2 connections stay open depending on the run,
+and its buses are 0.44–0.62 bundled against the human's 0.80. Bus nets attract each other inside
+Freerouting (patch `0002-bus-attraction`): a bus net's path costs less alongside its routed
+neighbours, which lifted coldfire's bundled share from about 0.3 without changing how many
+connections close; most of what is still missing sits at the pins, where Freerouting's fan-out
+places each pin's escape on its own.
 
 ### Boards it was never tuned on
 
