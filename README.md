@@ -96,7 +96,7 @@ KiCad's Python API does not load it within 15 minutes on this machine.
 | escape | fine-pitch pads of nets that need wide copper get a short narrow stub and a via, where Freerouting would neck the trace below the rules or give up |
 | stitch | SMD pads of the plane net (GND by default) get a via into the pour |
 | export + rule fix | Specctra export, then corrected: via sizes raised to the board's minimum diameter/drill/annular ring, net-class widths/clearances raised to the board minimums, custom `.kicad_dru` clearance rules (net-name wildcards, net classes) turned into router classes, placement rooms that forbid nothing no longer exported as keepouts |
-| buses | runs of neighbouring pins between two parts (found in the netlist) are laid as parallel bundles on a copy of the board, middle net first with room for the rest, the others in a corridor next to their neighbour; the bundled copy is a routing variant of its own |
+| buses | runs of neighbouring pins between two parts (found in the netlist) are laid as parallel bundles on a copy of the board, middle net first with room for the rest, the others in a corridor next to their neighbour; differential pairs (net names ending P/N, +/-, DP/DM) are laid the same way as 2-net bundles (pad spacing up to `[buses] pair_max_gap`, raise it for staggered connectors such as RJ45); the bundled copy is a routing variant of its own |
 | route | Freerouting on N item-order seeds in parallel, stopping when passes stop improving; while a wave of runs takes under two minutes, more seeds are added (up to 12), which evens out Freerouting's run-to-run spread on small boards. 2-layer boards also get two layout styles people use: most copper on a main side (the SMD side, or the solder side of a through-hole board) with the other side for crossings, and single-sided with jumpers |
 | score | every result is imported into KiCad, zones refilled, KiCad DRC; ranked by unconnected, errors, vias, share of copper off the main side, length. The best result of each style that is within reach gets finished |
 | finish | for the best candidates: drop necked/dangling/offending items, last-mile router for what is open, vias for cut-off pour islands, silkscreen clean-up; repeated a few rounds. The last-mile router works on a grid with its own clearance checks (copper text included), prefers straight runs with 45°/90° corners, joins cut-off pads to the nearest piece of their pour, retries tight passages on a finer grid, and can rip up a few unlocked tracks of other nets and route them again (undone unless everything fits). Then the clean-up a person would do, each step kept only if the board does not get worse: buses re-laid as bundles (pushing other tracks aside), nets re-routed with fewer vias |
@@ -144,7 +144,8 @@ them, and let the tool do the rest.
   passes, and many connections stay open. More time helps but is slow.
 - Custom DRC rules that depend on footprints, courtyards, layers or item types are not passed to the
   router (only net-name and net-class clearance rules are).
-- No length matching, no differential-pair routing.
+- No length matching. Differential pairs are laid side by side as 2-net bundles, but without a controlled
+  gap or impedance.
 - Placement (`compact`) needs to be told which parts are fixed by the case; nothing in a KiCad file says so.
 - Tested on Windows only so far.
 

@@ -53,6 +53,9 @@ fanout_first = false    # experimental: fan fine-pitch parts out first (short Fr
                         # lay the bundles to those vias instead of cutting them back
 trim_fanout = 1.5       # bundles stop this far (mm) from fine-pitch parts; their fan-out is routed
                         # pin by pin, so the bundle vias do not wall the part in (0: pad to pad)
+pair_max_gap = 2.0      # differential pairs (net names ending P/N, +/-, DP/DM) are laid as 2-net bundles
+                        # when their pads sit at most this far apart (mm) at both parts; connectors with
+                        # staggered rows need more (RJ45: pins 1/2 are 2.8 mm, 3/6 are 4.6 mm apart -> 5.0)
 
 [freerouting]
 seeds = 4               # runs with different item orders; the best one wins

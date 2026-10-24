@@ -88,7 +88,9 @@ PAIR_ENDINGS = (("+", "-"), ("P", "N"), ("_P", "_N"), ("DP", "DM"), ("DP", "DN")
 
 def find_pairs(b, max_gap: float = 2.0) -> list[dict]:
     """Differential pairs: two nets whose names differ only in the ending (+/-, P/N), each joining
-    the same two footprints from neighbouring pins (at most max_gap mm apart on both sides)."""
+    the same two footprints from neighbouring pins (at most max_gap mm apart on both sides).
+    Connectors with staggered pin rows set their pair pins further apart (RJ45: 2.8 mm for 1/2,
+    4.6 mm for 3/6); raise max_gap for those ([buses] pair_max_gap)."""
     pads: dict[str, list] = {}
     for f in b.GetFootprints():
         for p in f.Pads():
@@ -167,12 +169,14 @@ def main() -> None:
     ap.add_argument("board")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--pairs", action="store_true", help="also list differential pairs (to lay them as 2-net bundles)")
+    ap.add_argument("--pair-max-gap", type=float, default=2.0,
+                    help="pads of a pair at most this far apart (mm) at both parts (default 2.0; RJ45 needs ~5)")
     ns = ap.parse_args()
     b = pcbnew.LoadBoard(ns.board)
     buses = find_buses(b)
     if ns.pairs:
         taken = {n for bus in buses for n in bus["nets"]}
-        buses += [p for p in find_pairs(b) if not set(p["nets"]) & taken]
+        buses += [p for p in find_pairs(b, ns.pair_max_gap) if not set(p["nets"]) & taken]
     weighted = length = 0.0
     for bus in buses:
         share, total = parallelism(b, bus)
